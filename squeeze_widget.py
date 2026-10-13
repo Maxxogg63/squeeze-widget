@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.3.1 — squeeze_filters.txt, фикс pullback, is_trend, окно БИТ
+Версия 1.3.2 — алерт при появлении, фиксированные границы
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -9,6 +9,8 @@ Changelog:
             фикс: is_trend (тренд vs диапазон)
             секция "БИТ СРАБОТАЛ" + squeeze_bit_history.csv
             отдельное окно "Отработанные БИТ"
+    1.3.2 — фикс: алерт при первом появлении активной монеты
+            фикс: границы диапазона фиксированы (не сжимаются)
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -782,11 +784,7 @@ def update_state(sym, state, k):
     if sv == "cancelled":
         return None
 
-    if high < state["range_high"]:
-        state["range_high"] = high
-    if low > state["range_low"]:
-        state["range_low"] = low
-
+    # v1.3.2: границы НЕ сжимаем — фиксируем при создании
     state["candles_in_range"] += 1
     state["last_update_ts"] = now
 
@@ -922,7 +920,10 @@ def handle_kline_5m(sym, k):
         new_state = build_state(sym, buf, candles_1h)
         if new_state:
             squeeze_state[sym] = new_state
-            alerts_q.put({"type": "forming", "symbol": sym,
+            # v1.3.2: правильный тип события при первом появлении
+            ev_type = "new_active" if new_state["status"] == "active" \
+                else "forming"
+            alerts_q.put({"type": ev_type, "symbol": sym,
                           "state": new_state})
         return
 
@@ -2078,7 +2079,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.3.1 ===")
+    worker_log("=== start v1.3.2 ===")
 
     if "--test" in sys.argv:
         inject_test()
