@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.4 — выгрузка активных в Watchlist
+Версия 2.0.5 — фикс watchlist (io.open → open)
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -19,6 +19,7 @@ Changelog:
             зелёный для +, красный для -
             окно расширено до 620px
     2.0.4 — кнопка 📤 Watchlist (выгрузка активных в .txt для TradingView)
+    2.0.5 — фикс: io.open → open (io не импортирован)
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -55,7 +56,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.4"
+WIDGET_VERSION = "2.0.5"
 
 
 # ============ ЦВЕТА ============
@@ -1966,7 +1967,7 @@ class SqueezeWidget(ctk.CTk):
             # TradingView: одна строка, символы через запятую
             line = ",".join(tickers)
             path = os.path.join(BASE_DIR, "watchlist.txt")
-            with io.open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(line)
             worker_log(f"[watchlist] saved {len(tickers)} symbols to {path}")
             # открыть папку
