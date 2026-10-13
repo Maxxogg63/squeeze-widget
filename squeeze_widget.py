@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.3.2 — алерт при появлении, фиксированные границы
+Версия 1.3.3 — метка «возможно тренд», версия в UI
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -11,6 +11,9 @@ Changelog:
             отдельное окно "Отработанные БИТ"
     1.3.2 — фикс: алерт при первом появлении активной монеты
             фикс: границы диапазона фиксированы (не сжимаются)
+    1.3.3 — is_trend больше не отсеивает, а помечает монету
+            метка «возможно тренд» в UI
+            номер версии внизу окна
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -48,6 +51,9 @@ LAST_SEEN_PATH = os.path.join(BASE_DIR, "last_seen_squeeze.txt")
 SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
+
+# версия виджета — отображается внизу окна
+WIDGET_VERSION = "1.3.3"
 
 
 # ============ ЦВЕТА ============
@@ -668,12 +674,8 @@ def find_local_min_start(candles_5m, t_high_ts):
 def build_state(sym, candles_5m, candles_1h):
     status["stats_buf"] += 1
 
-    # 1. ТРЕНД vs ДИАПАЗОН
-    if is_trend(candles_5m):
-        status["fail_trend"] += 1
-        if sym in DEBUG_SYMBOLS:
-            worker_log(f"DEBUG {sym}: REJECT at is_trend")
-        return None
+    # v1.3.3: НЕ отсеиваем тренд, только помечаем
+    is_trending_flag = is_trend(candles_5m)
 
     g1h = calc_growth_1h(candles_1h)
     if not g1h:
@@ -756,6 +758,7 @@ def build_state(sym, candles_5m, candles_1h):
         "low_after_high": low_after_high,
         "volume_24h": volume,
         "last_update_ts": now,
+        "is_trending": is_trending_flag,
     }
 
     if st_status == "active":
@@ -1654,6 +1657,13 @@ class SqueezeWidget(ctk.CTk):
         self.table_frame.pack(fill="both", expand=True,
                               padx=12, pady=(0, 8))
         self.row_widgets = []
+        # v1.3.3: номер версии внизу окна
+        self.version_lbl = ctk.CTkLabel(
+            self.main, text=f"v{WIDGET_VERSION}",
+            font=("Segoe UI", 8),
+            text_color=GREY, anchor="e"
+        )
+        self.version_lbl.pack(fill="x", padx=14, pady=(0, 4))
 
     def _build_menu(self):
         self.menu = Menu(self, tearoff=0, bg=BG_DARK, fg=MINT,
@@ -1939,6 +1949,15 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[5][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
+        # v1.3.3: метка «возможно тренд» для трендовых монет
+        if st.get("is_trending", False):
+            trend_lbl = ctk.CTkLabel(
+                row, text="возможно тренд",
+                font=("Segoe UI", 9, "italic"),
+                text_color=GREY, anchor="w"
+            )
+            trend_lbl.pack(side="left", padx=(8, 0))
+
         self.row_widgets.append(row)
 
     def _render(self):
@@ -2079,7 +2098,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.3.2 ===")
+    worker_log("=== start v1.3.3 ===")
 
     if "--test" in sys.argv:
         inject_test()
