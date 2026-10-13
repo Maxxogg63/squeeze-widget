@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.1 — фикс Механизма 2, скролл главного списка
+Версия 2.0.2 — колонка РОСТ, лента событий
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -12,6 +12,9 @@ Changelog:
         Убраны find_active_range, t_high, is_trend
     2.0.1 — фикс Механизма 2: range_high фиксируется на момент начала
             скролл главного списка
+    2.0.2 — колонка РОСТ в активных
+            лента событий (кнопка 📋 Лог)
+            плашки только для new_active и bit_signal
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -48,7 +51,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.1"
+WIDGET_VERSION = "2.0.2"
 
 
 # ============ ЦВЕТА ============
@@ -165,6 +168,10 @@ squeeze_state: dict = {}       # активные диапазоны
 backstage: dict = {}           # задний двор
 bit_history: list = []         # история БИТ
 bit_history_lock = threading.Lock()
+
+# v2.0.2: лента событий
+event_log: "collections.deque" = deque(maxlen=200)
+event_log_lock = threading.Lock()
 
 cfg = dict(DEFAULTS)
 
@@ -331,6 +338,51 @@ def log_squeeze(sym, state):
                 f"{state.get('volume_24h', 0):.0f}")) + "\n")
     except Exception as e:
         print("log_squeeze error:", e)
+
+
+def add_event(etype, sym, state, extra=""):
+    """v2.0.2: добавляет событие в ленту."""
+    try:
+        now = time.time()
+        ticker = sym.replace("USDT", "")
+        info = ""
+        color = PEACH
+        if etype == "new_active":
+            info = f"активен {state.get('range_low', 0):.6f}—{state.get('range_high', 0):.6f}"
+            color = PEACH
+        elif etype == "bit_signal":
+            info = "БИТ сработал"
+            color = GOLD
+        elif etype == "breakout":
+            side = "вверх" if extra == "up" else "вниз"
+            info = f"вынос {side}"
+            color = GREEN if extra == "up" else RED
+        elif etype == "return":
+            info = "возврат в диапазон"
+            color = PEACH
+        elif etype == "cancelled":
+            info = "отменён (уход вниз)"
+            color = RED
+        elif etype == "return_from_backstage":
+            info = "возврат (задний двор)"
+            color = PEACH
+        elif etype == "touch":
+            info = f"касание ({extra})"
+            color = SAND
+        else:
+            info = etype
+
+        with event_log_lock:
+            event_log.append({
+                "ts": now,
+                "time": _ts(now)[11:19],   # только время
+                "ticker": ticker,
+                "event": etype,
+                "info": info,
+                "color": color,
+            })
+    except Exception as e:
+        worker_log(f"[event_log] error: {e}")
 
 
 def log_expired(sym, state, reason, final_price):
@@ -1504,6 +1556,142 @@ class BitHistoryWindow(ctk.CTkToplevel):
         self.after(10000, self._auto_refresh)
 
 
+# ============ ОКНО ЛЕНТЫ СОБЫТИЙ ============
+class EventLogWindow(ctk.CTkToplevel):
+    WIDTH = 700
+    HEIGHT = 500
+
+    COLUMNS = [
+        ("ВРЕМЯ",    80),
+        ("ТИКЕР",    90),
+        ("СОБЫТИЕ",  130),
+        ("ИНФО",     350),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.overrideredirect(False)
+        self.title("Лента событий")
+        self.configure(fg_color=BG)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self.resizable(True, True)
+        px = parent.winfo_x()
+        py = parent.winfo_y()
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{px + 80}+{py + 80}")
+        self._build()
+        self.refresh()
+        self._auto_refresh()
+
+    def _build(self):
+        head = ctk.CTkFrame(self, fg_color=BG_DARK, height=48,
+                            corner_radius=0)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+
+        title = ctk.CTkLabel(head, text="📋 Лента событий",
+                             font=("Segoe UI", 16, "bold"),
+                             text_color=PEACH)
+        title.pack(side="left", padx=16)
+
+        self.count_label = ctk.CTkLabel(head, text="",
+                                        font=("Segoe UI", 11),
+                                        text_color=SAND)
+        self.count_label.pack(side="left", padx=8)
+
+        btn_close = ctk.CTkButton(head, text="✕", width=32, height=28,
+                                  font=("Segoe UI", 12, "bold"),
+                                  fg_color=ACCENT, hover_color="#8B2E2E",
+                                  text_color=BG_DARK,
+                                  command=self.destroy)
+        btn_close.pack(side="right", padx=8)
+
+        btn_refresh = ctk.CTkButton(head, text="Обновить", width=90,
+                                    height=28,
+                                    font=("Segoe UI", 11),
+                                    fg_color=ACCENT,
+                                    hover_color=ACCENT_HOVER,
+                                    text_color=BG_DARK,
+                                    command=self.refresh)
+        btn_refresh.pack(side="right", padx=4)
+
+        colhead = ctk.CTkFrame(self, fg_color=BG_DARK, height=28,
+                               corner_radius=0)
+        colhead.pack(fill="x", padx=8, pady=(4, 0))
+        colhead.pack_propagate(False)
+        for name, w in self.COLUMNS:
+            lbl = ctk.CTkLabel(colhead, text=name,
+                               font=("Segoe UI", 10, "bold"),
+                               text_color=SAND, width=w, anchor="w")
+            lbl.pack(side="left", padx=(4, 0))
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self, fg_color=BG,
+                                                    corner_radius=0)
+        self.scroll_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def refresh(self):
+        for w in self.scroll_frame.winfo_children():
+            w.destroy()
+        with event_log_lock:
+            rows = list(event_log)
+        self.count_label.configure(text=f"всего: {len(rows)}")
+        rows = list(reversed(rows))
+        if not rows:
+            lbl = ctk.CTkLabel(self.scroll_frame,
+                               text="Пока нет событий",
+                               font=("Segoe UI", 12, "italic"),
+                               text_color=GREY)
+            lbl.pack(pady=40)
+            return
+        for i, row in enumerate(rows):
+            self._build_row(row, i)
+
+    def _build_row(self, row, idx):
+        bg = BG_ROW_ALT if idx % 2 else BG
+        row_frame = ctk.CTkFrame(self.scroll_frame, fg_color=bg,
+                                  height=28, corner_radius=4)
+        row_frame.pack(fill="x", pady=1)
+        row_frame.pack_propagate(False)
+
+        ts = row.get("time", "")
+        ticker = row.get("ticker", "")
+        event = row.get("event", "")
+        info = row.get("info", "")
+        color = row.get("color", MINT)
+
+        values = [
+            (ts, SAND, "normal"),
+            (ticker, GOLD, "bold"),
+            (self._event_name(event), color, "bold"),
+            (info, MINT, "normal"),
+        ]
+        for (name, w), (val, c, weight) in zip(self.COLUMNS, values):
+            lbl = ctk.CTkLabel(row_frame, text=str(val),
+                               font=("Segoe UI", 10, weight),
+                               text_color=c, width=w, anchor="w")
+            lbl.pack(side="left", padx=(4, 0))
+
+    @staticmethod
+    def _event_name(etype):
+        names = {
+            "new_active": "новый активный",
+            "bit_signal": "★ БИТ сработал",
+            "breakout": "вынос",
+            "return": "возврат",
+            "return_from_backstage": "возврат (двор)",
+            "cancelled": "отменён",
+            "touch": "касание",
+            "forming": "формируется",
+        }
+        return names.get(etype, etype)
+
+    def _auto_refresh(self):
+        try:
+            self.refresh()
+        except Exception as e:
+            worker_log(f"event window auto_refresh error: {e}")
+        self.after(5000, self._auto_refresh)
+
+
 # ============ ГЛАВНОЕ ОКНО ============
 class SqueezeWidget(ctk.CTk):
     WIDTH = 520
@@ -1516,12 +1704,13 @@ class SqueezeWidget(ctk.CTk):
     IDLE_H = 60
 
     COLUMNS = [
-        ("ТИКЕР",    90),
-        ("ВРЕМЯ",    70),
-        ("ШИРИНА",   70),
-        ("ПОЗИЦИЯ",  90),
-        ("КАСАНИЕ",  60),
-        ("ОБЪЁМ",    70),
+        ("ТИКЕР",    80),
+        ("ВРЕМЯ",    65),
+        ("РОСТ",     60),
+        ("ШИРИНА",   60),
+        ("ПОЗИЦИЯ",  80),
+        ("КАСАНИЕ",  55),
+        ("ОБЪЁМ",    65),
     ]
     COL_ICON_W = 24
     COL_PAD = 6
@@ -1570,6 +1759,7 @@ class SqueezeWidget(ctk.CTk):
 
         self.active_popups = []
         self.bit_window = None
+        self.event_window = None
         self.poll()
 
     def _setup_alt_tab(self):
@@ -1631,6 +1821,13 @@ class SqueezeWidget(ctk.CTk):
                                 text_color=BG_DARK,
                                 command=self._open_bit_window)
         btn_bit.pack(side="right", padx=(0, 4))
+
+        btn_log = ctk.CTkButton(h, text="📋 Лог", width=70, height=24,
+                                font=("Segoe UI", 11, "bold"),
+                                fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                text_color=BG_DARK,
+                                command=self._open_event_window)
+        btn_log.pack(side="right", padx=(0, 4))
 
     def _build_legend(self):
         self.legend = LegendBar(self.main)
@@ -1698,6 +1895,8 @@ class SqueezeWidget(ctk.CTk):
                               command=self._clear_history)
         self.menu.add_command(label="Открыть окно БИТ",
                               command=self._open_bit_window)
+        self.menu.add_command(label="Открыть лог событий",
+                              command=self._open_event_window)
         self.menu.add_separator()
         self.menu.add_command(label="Выход", command=self._on_close)
         self.bind("<Button-3>", self._show_menu)
@@ -1712,6 +1911,17 @@ class SqueezeWidget(ctk.CTk):
             except Exception:
                 pass
         self.bit_window = BitHistoryWindow(self)
+
+    def _open_event_window(self):
+        if self.event_window is not None:
+            try:
+                if self.event_window.winfo_exists():
+                    self.event_window.lift()
+                    self.event_window.focus_force()
+                    return
+            except Exception:
+                pass
+        self.event_window = EventLogWindow(self)
 
     def _copy_ticker(self, symbol):
         try:
@@ -1764,6 +1974,11 @@ class SqueezeWidget(ctk.CTk):
         if self.bit_window is not None:
             try:
                 self.bit_window.destroy()
+            except Exception:
+                pass
+        if self.event_window is not None:
+            try:
+                self.event_window.destroy()
             except Exception:
                 pass
         worker_log("=== stop ===")
@@ -1945,12 +2160,25 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[1][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
+        # v2.0.2: РОСТ (24ч)
+        growth = st.get("growth_24h", 0)
+        if growth >= 50:
+            g_color = GOLD
+        elif growth >= 20:
+            g_color = PEACH
+        else:
+            g_color = MINT
+        l = ctk.CTkLabel(row, text=f"{growth:+.1f}%",
+                         font=("Segoe UI", 11, "bold"), text_color=g_color,
+                         width=self.COLUMNS[2][1], anchor="w")
+        l.pack(side="left", padx=(self.COL_PAD, 0))
+
         rh = st.get("range_high", 0)
         rl = st.get("range_low", 0)
         width = (rh / rl - 1) * 100 if rl > 0 else 0
         l = ctk.CTkLabel(row, text=f"{width:.2f}%",
                          font=("Segoe UI", 11, "bold"), text_color=PEACH,
-                         width=self.COLUMNS[2][1], anchor="w")
+                         width=self.COLUMNS[3][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
         try:
@@ -1970,13 +2198,13 @@ class SqueezeWidget(ctk.CTk):
             pos_text = "Середина"
         l = ctk.CTkLabel(row, text=pos_text,
                          font=("Segoe UI", 11), text_color=MINT,
-                         width=self.COLUMNS[3][1], anchor="w")
+                         width=self.COLUMNS[4][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
         tc = st.get("touch_count", 0)
         l = ctk.CTkLabel(row, text=f"{tc}" if tc else "—",
                          font=("Segoe UI", 11), text_color=SAND,
-                         width=self.COLUMNS[4][1], anchor="w")
+                         width=self.COLUMNS[5][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
         vol = st.get("volume_24h", 0)
@@ -1988,7 +2216,7 @@ class SqueezeWidget(ctk.CTk):
             vt = f"{vol/1e3:.0f}K"
         l = ctk.CTkLabel(row, text=vt,
                          font=("Segoe UI", 11), text_color=PEACH,
-                         width=self.COLUMNS[5][1], anchor="w")
+                         width=self.COLUMNS[6][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
         if is_long:
@@ -2073,11 +2301,20 @@ class SqueezeWidget(ctk.CTk):
                 break
             if self.paused:
                 continue
-            if ev.get("type") == "new_active":
+            etype = ev.get("type", "")
+            sym = ev.get("symbol", "")
+            st = ev.get("state", {})
+            # v2.0.2: добавляем ВСЁ в ленту
+            if etype and sym:
+                extra = ev.get("side", "")
+                add_event(etype, sym, st, extra=extra)
+            # v2.0.2: звук только на важные
+            if etype == "new_active":
                 threading.Thread(target=play_sound, daemon=True).start()
-            if ev.get("type") == "bit_signal":
+            if etype == "bit_signal":
                 threading.Thread(target=play_sound, daemon=True).start()
-            if ev.get("type") != "forming":
+            # v2.0.2: плашки ТОЛЬКО для важных
+            if etype in ("new_active", "bit_signal"):
                 self._show_popup(ev)
             changed = True
 
