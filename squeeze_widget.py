@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.3 — ИЗМ 24ч в колонке, шире окно
+Версия 2.0.4 — выгрузка активных в Watchlist
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -18,6 +18,7 @@ Changelog:
     2.0.3 — колонка РОСТ заменена на ИЗМ 24ч (изменение цены за 24ч)
             зелёный для +, красный для -
             окно расширено до 620px
+    2.0.4 — кнопка 📤 Watchlist (выгрузка активных в .txt для TradingView)
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -54,7 +55,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.3"
+WIDGET_VERSION = "2.0.4"
 
 
 # ============ ЦВЕТА ============
@@ -1839,6 +1840,13 @@ class SqueezeWidget(ctk.CTk):
                                 command=self._open_event_window)
         btn_log.pack(side="right", padx=(0, 4))
 
+        btn_wl = ctk.CTkButton(h, text="📤 WL", width=60, height=24,
+                                font=("Segoe UI", 11, "bold"),
+                                fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                text_color=BG_DARK,
+                                command=self._export_watchlist)
+        btn_wl.pack(side="right", padx=(0, 4))
+
     def _build_legend(self):
         self.legend = LegendBar(self.main)
         self.legend.pack(fill="x", padx=12, pady=(2, 0))
@@ -1907,6 +1915,8 @@ class SqueezeWidget(ctk.CTk):
                               command=self._open_bit_window)
         self.menu.add_command(label="Открыть лог событий",
                               command=self._open_event_window)
+        self.menu.add_command(label="Выгрузить Watchlist",
+                              command=self._export_watchlist)
         self.menu.add_separator()
         self.menu.add_command(label="Выход", command=self._on_close)
         self.bind("<Button-3>", self._show_menu)
@@ -1940,6 +1950,32 @@ class SqueezeWidget(ctk.CTk):
             worker_log(f"[copy] {symbol}")
         except Exception as e:
             worker_log(f"[copy] error: {e}")
+
+    def _export_watchlist(self):
+        """v2.0.4: выгрузка активных монет в .txt для TradingView."""
+        try:
+            # собираем тикеры из активных
+            tickers = []
+            for sym, st in squeeze_state.items():
+                sv = st.get("status", "active")
+                if sv in ("active", "broken_up", "broken_down"):
+                    tickers.append(f"BINANCE:{sym}")
+            if not tickers:
+                worker_log("[watchlist] no active symbols")
+                return
+            # TradingView: одна строка, символы через запятую
+            line = ",".join(tickers)
+            path = os.path.join(BASE_DIR, "watchlist.txt")
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write(line)
+            worker_log(f"[watchlist] saved {len(tickers)} symbols to {path}")
+            # открыть папку
+            try:
+                os.startfile(BASE_DIR)
+            except Exception:
+                pass
+        except Exception as e:
+            worker_log(f"[watchlist] error: {e}")
 
     def _calc_render_hash(self):
         now = time.time()
