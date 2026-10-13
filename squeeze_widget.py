@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.2 — колонка РОСТ, лента событий
+Версия 2.0.3 — ИЗМ 24ч в колонке, шире окно
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -15,6 +15,9 @@ Changelog:
     2.0.2 — колонка РОСТ в активных
             лента событий (кнопка 📋 Лог)
             плашки только для new_active и bit_signal
+    2.0.3 — колонка РОСТ заменена на ИЗМ 24ч (изменение цены за 24ч)
+            зелёный для +, красный для -
+            окно расширено до 620px
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -51,7 +54,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.2"
+WIDGET_VERSION = "2.0.3"
 
 
 # ============ ЦВЕТА ============
@@ -583,8 +586,14 @@ def calc_growth_1h(candles_1h):
     growth = (max_high / min_low - 1) * 100
     # последний индекс хая
     idx_high = len(highs) - 1 - highs[::-1].index(max_high)
+    # v2.0.3: изменение цены за 24ч (для показа)
+    close_24h_ago = candles_1h[0]["close"]
+    close_now = candles_1h[-1]["close"]
+    change_24h = (close_now / close_24h_ago - 1) * 100 \
+        if close_24h_ago > 0 else 0.0
     return {
         "growth_24h": growth,
+        "change_24h": change_24h,   # новое
         "high_24h": max_high,
         "t_high_ts": candles_1h[idx_high]["t"] / 1000.0,
     }
@@ -731,6 +740,7 @@ def build_active_state(sym, candles_5m, candles_1h):
         "breakout_count": 0,
         "exit_candles": 0,        # счётчик close вне
         "growth_24h": g1h["growth_24h"],
+        "change_24h": g1h.get("change_24h", 0.0),
         "volume_24h": volume,
         "high_24h": g1h["high_24h"],
         "last_update_ts": now,
@@ -1694,7 +1704,7 @@ class EventLogWindow(ctk.CTkToplevel):
 
 # ============ ГЛАВНОЕ ОКНО ============
 class SqueezeWidget(ctk.CTk):
-    WIDTH = 520
+    WIDTH = 620
     HEADER_H = 44
     LEGEND_H = 18
     COL_HEADER_H = 26
@@ -1704,13 +1714,13 @@ class SqueezeWidget(ctk.CTk):
     IDLE_H = 60
 
     COLUMNS = [
-        ("ТИКЕР",    80),
-        ("ВРЕМЯ",    65),
-        ("РОСТ",     60),
-        ("ШИРИНА",   60),
-        ("ПОЗИЦИЯ",  80),
-        ("КАСАНИЕ",  55),
-        ("ОБЪЁМ",    65),
+        ("ТИКЕР",     100),
+        ("ВРЕМЯ",     75),
+        ("ИЗМ 24ч",   80),
+        ("ШИРИНА",    75),
+        ("ПОЗИЦИЯ",   95),
+        ("КАСАНИЕ",   65),
+        ("ОБЪЁМ",     75),
     ]
     COL_ICON_W = 24
     COL_PAD = 6
@@ -2160,16 +2170,14 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[1][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
-        # v2.0.2: РОСТ (24ч)
-        growth = st.get("growth_24h", 0)
-        if growth >= 50:
-            g_color = GOLD
-        elif growth >= 20:
-            g_color = PEACH
+        # v2.0.3: ИЗМ 24ч (изменение цены за 24ч)
+        change = st.get("change_24h", 0)
+        if change >= 0:
+            ch_color = GREEN
         else:
-            g_color = MINT
-        l = ctk.CTkLabel(row, text=f"{growth:+.1f}%",
-                         font=("Segoe UI", 11, "bold"), text_color=g_color,
+            ch_color = RED
+        l = ctk.CTkLabel(row, text=f"{change:+.1f}%",
+                         font=("Segoe UI", 11, "bold"), text_color=ch_color,
                          width=self.COLUMNS[2][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
