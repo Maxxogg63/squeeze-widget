@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.4.0 — поиск активного диапазона, порог выхода 5%
+Версия 1.4.1 — дедупликация БИТ, колонка диапазона в окне БИТ
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -21,6 +21,8 @@ Changelog:
     1.4.0 — ПОЛНАЯ ПЕРЕРАБОТКА: поиск последнего АКТИВНОГО диапазона
             (пропускает отработавшие БИТ), порог выхода 5%
             записи БИТ при прогреве, много выходов из одного диапазона
+    1.4.1 — дедупликация БИТ в истории (по symbol + fired_at)
+            в окне БИТ добавлена колонка ДИАПАЗОН (low — high)
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -60,7 +62,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
 
 # версия виджета — отображается внизу окна
-WIDGET_VERSION = "1.4.0"
+WIDGET_VERSION = "1.4.1"
 
 
 # ============ ЦВЕТА ============
@@ -446,12 +448,20 @@ def load_bit_history():
 def add_bit_history(sym, state, exit_price):
     """Добавляет новую запись в историю БИТ."""
     now = time.time()
+    fired_at_str = _ts(now)
+    # v1.4.1: дедупликация — если (symbol, fired_at) уже есть, не добавляем
+    with bit_history_lock:
+        for existing in bit_history:
+            if existing.get("symbol") == sym and \
+               existing.get("fired_at") == fired_at_str:
+                worker_log(f"[v1.4.1] dedup skipped {sym} {fired_at_str}")
+                return None
     width = (state["range_high"] / state["range_low"] - 1) * 100 \
         if state["range_low"] > 0 else 0
     row = {
         "symbol": sym,
         "detected_at": _ts(state.get("started", now)),
-        "fired_at": _ts(now),
+        "fired_at": fired_at_str,
         "duration_in_range_sec": int(now - state.get("started", now)),
         "range_high": state["range_high"],
         "range_low": state["range_low"],
@@ -1405,17 +1415,18 @@ class BitHistoryWindow(ctk.CTkToplevel):
     HEIGHT = 600
 
     COLUMNS = [
-        ("ТИКЕР",       90),
-        ("ОБНАРУЖЕН",   140),
-        ("СРАБОТАЛ",    140),
-        ("В ДИАП",      80),
-        ("ШИРИНА",      70),
-        ("РОСТ",        70),
-        ("ОТКАТ",       70),
-        ("ЦЕНА ВЫХ",    100),
-        ("+1ч",         80),
-        ("+6ч",         80),
-        ("+24ч",        80),
+        ("ТИКЕР",       80),
+        ("ОБНАРУЖЕН",   130),
+        ("СРАБОТАЛ",    130),
+        ("В ДИАП",      70),
+        ("ДИАПАЗОН",    180),   # v1.4.1: low — high
+        ("ШИРИНА",      65),
+        ("РОСТ",        60),
+        ("ОТКАТ",       60),
+        ("ЦЕНА ВЫХ",    90),
+        ("+1ч",         60),
+        ("+6ч",         60),
+        ("+24ч",        60),
     ]
 
     def __init__(self, parent):
@@ -1549,6 +1560,8 @@ class BitHistoryWindow(ctk.CTkToplevel):
         detected = row.get("detected_at", "")
         fired = row.get("fired_at", "")
         duration_sec = row.get("duration_in_range_sec", 0)
+        range_high = row.get("range_high", 0)
+        range_low = row.get("range_low", 0)
         width = row.get("width_pct", 0)
         growth = row.get("growth_24h", 0)
         pullback = row.get("pullback", 0)
@@ -1557,11 +1570,18 @@ class BitHistoryWindow(ctk.CTkToplevel):
         pct_6h = row.get("pct_after_6h", 0)
         pct_24h = row.get("pct_after_24h", 0)
 
+        # v1.4.1: диапазон в одной колонке
+        if range_low and range_high:
+            rng_str = f"{range_low:.4f} — {range_high:.4f}"
+        else:
+            rng_str = "—"
+
         values = [
             (ticker, GOLD, "bold"),
             (detected[:16] if detected else "—", MINT, "normal"),
             (fired[:16] if fired else "—", MINT, "normal"),
             (fmt_duration(duration_sec), MINT, "normal"),
+            (rng_str, MINT, "normal"),    # v1.4.1
             (f"{width:.2f}%" if width else "—", PEACH, "bold"),
             (f"{growth:.1f}%" if growth else "—", SAND, "normal"),
             (f"{pullback:.1f}%" if pullback else "—", SAND, "normal"),
@@ -2252,7 +2272,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.4.0 ===")
+    worker_log("=== start v1.4.1 ===")
 
     if "--test" in sys.argv:
         inject_test()
