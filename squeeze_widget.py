@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.3.4 — крупная версия, фикс мерцания, копирование тикера
+Версия 1.4.0 — поиск активного диапазона, порог выхода 5%
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -17,6 +17,10 @@ Changelog:
     1.3.4 — версия крупнее и золотая
             фикс мерцания (хэш-сравнение, перерисовка раз в минуту)
             ЛКМ по тикеру копирует полный символ (GTCUSDT) в буфер
+    1.3.5 — окно появляется в Alt+Tab и панели задач
+    1.4.0 — ПОЛНАЯ ПЕРЕРАБОТКА: поиск последнего АКТИВНОГО диапазона
+            (пропускает отработавшие БИТ), порог выхода 5%
+            записи БИТ при прогреве, много выходов из одного диапазона
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -56,7 +60,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
 
 # версия виджета — отображается внизу окна
-WIDGET_VERSION = "1.3.4"
+WIDGET_VERSION = "1.4.0"
 
 
 # ============ ЦВЕТА ============
@@ -99,6 +103,7 @@ DEFAULTS = {
 
     # Касания и выносы
     "touch_gap_pct": 0.2,
+    "breakout_threshold_pct": 5.0,   # v1.4.0: порог выхода из диапазона (%)
     "breakout_exit_candles": 6,
     "breakout_exit_distance_pct": 1.0,
     "backstage_ttl_hours": 12,
@@ -138,6 +143,7 @@ FILTER_KEYS = [
     "range_active_min_candles",
     "trend_check_candles",
     "trend_check_max_new_highs",
+    "breakout_threshold_pct",
 ]
 
 REST_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -278,6 +284,18 @@ trend_check_candles = 5
 # Больше -> мягче. Меньше -> строже.
 # Дефолт: 3
 trend_check_max_new_highs = 3
+
+# ------------------------------------------------------------
+# ВЫХОД ИЗ ДИАПАЗОНА
+# ------------------------------------------------------------
+
+# На сколько % цена должна уйти за границу диапазона,
+# чтобы это считалось "выходом" (а не шумом).
+# 5 = цена должна пройти на 5% выше range_high или ниже range_low.
+# Больше -> строже (только сильные выходы).
+# Меньше -> мягче (ловит даже слабые выходы).
+# Дефолт: 5
+breakout_threshold_pct = 5
 """
     try:
         with open(FILTERS_PATH, "w", encoding="utf-8") as f:
@@ -635,7 +653,15 @@ def is_trend(candles_5m):
     return False
 
 
-def find_local_min_start(candles_5m, t_high_ts):
+def find_active_range(candles_5m, t_high_ts):
+    """
+    v1.4.0: Ищет ПОСЛЕДНИЙ АКТИВНЫЙ диапазон.
+    Пропускает диапазоны, из которых уже был выход (>5%).
+    
+    Возвращает (start_idx, end_idx, exits_list) или None.
+    exits_list — список выходов вверх (для записи в историю БИТ).
+    """
+    # отбираем свечи после t_high
     after_high = []
     for i, c in enumerate(candles_5m):
         if c["t"] >= t_high_ts:
@@ -644,11 +670,24 @@ def find_local_min_start(candles_5m, t_high_ts):
     if len(after_high) < cfg["range_forming_min_candles"]:
         return None
 
+    breakout_threshold = cfg.get("breakout_threshold_pct", 5.0) / 100.0
+
+    # ищем ПОСЛЕДНИЙ активный диапазон.
+    # идём от конца к началу, ищем последний "спокойный" блок.
+    # стратегия: найти последний локальный минимум,
+    # после которого нет выхода > 5% вверх.
+    
     N = cfg["local_min_window"]
-    candidates = []
+    exits = []   # все выходы вверх, найденные в процессе
+    
+    # идём по свечам, ищем локальные минимумы
+    last_active_start = None
+    
     for k in range(N, len(after_high) - N):
         orig_i = after_high[k][0]
         low_k = after_high[k][1]["low"]
+        
+        # проверяем, локальный ли минимум
         is_local_min = True
         for j in range(k - N, k + N + 1):
             if j == k:
@@ -656,22 +695,58 @@ def find_local_min_start(candles_5m, t_high_ts):
             if after_high[j][1]["low"] < low_k:
                 is_local_min = False
                 break
-        if is_local_min:
-            candidates.append((k, orig_i, low_k))
-
-    if not candidates:
-        return None
-
-    for k, orig_i, low_k in candidates:
-        broken = False
-        for j in range(orig_i + 1, len(candles_5m)):
-            if candles_5m[j]["low"] < low_k:
-                broken = True
+        if not is_local_min:
+            continue
+        
+        # проверяем: был ли выход вверх после этого минимума?
+        # считаем range_high = max(high) от orig_i до конца
+        subset = list(candles_5m)[orig_i:]
+        if len(subset) < cfg["range_forming_min_candles"]:
+            continue
+        
+        # ищем первый "выход" вверх: high > range_high * (1 + threshold)
+        # но range_high — это максимум за какой период?
+        # логика: смотрим, как цена ведёт себя после orig_i.
+        # если после orig_i цена сделала "новый хай" и ушла выше на 5% —
+        # это выход, а не диапазон.
+        
+        # Считаем "зафиксированный" range_high на первых N свечах после orig_i
+        first_n = subset[:cfg["range_forming_min_candles"]]
+        rh_initial = max(c["high"] for c in first_n)
+        rl_initial = min(c["low"] for c in first_n)
+        
+        # теперь смотрим, что было ПОСЛЕ первых N свечей
+        has_breakout_up = False
+        has_breakout_down = False
+        for c in subset[cfg["range_forming_min_candles"]:]:
+            if c["high"] > rh_initial * (1 + breakout_threshold):
+                has_breakout_up = True
                 break
-        if not broken:
-            return orig_i
-
-    return None
+            if c["low"] < rl_initial * (1 - breakout_threshold):
+                has_breakout_down = True
+                break
+        
+        if not has_breakout_up and not has_breakout_down:
+            # этот диапазон активен (нет выхода)
+            last_active_start = orig_i
+        else:
+            # был выход — записываем в историю если вверх
+            if has_breakout_up:
+                # найдём цену выхода
+                exit_price = None
+                for c in subset[cfg["range_forming_min_candles"]:]:
+                    if c["high"] > rh_initial * (1 + breakout_threshold):
+                        exit_price = c["high"]
+                        break
+                exits.append({
+                    "start_idx": orig_i,
+                    "rh": rh_initial,
+                    "rl": rl_initial,
+                    "exit_price": exit_price,
+                    "exit_ts": c["t"] / 1000.0,
+                })
+    
+    return last_active_start, exits
 
 
 def build_state(sym, candles_5m, candles_1h):
@@ -702,13 +777,31 @@ def build_state(sym, candles_5m, candles_1h):
         return None
     status["stats_fresh"] += 1
 
-    start_idx = find_local_min_start(candles_5m, g1h["t_high"])
+    # v1.4.0: ищем ПОСЛЕДНИЙ АКТИВНЫЙ диапазон
+    active_start, past_exits = find_active_range(candles_5m, g1h["t_high"])
 
-    if start_idx is None:
-        n = cfg["range_forming_min_candles"]
-        if len(candles_5m) < n:
-            return None
-        start_idx = len(candles_5m) - n
+    # записываем прошлые БИТ в историю
+    for ex in past_exits:
+        try:
+            fake_state = {
+                "range_high": ex["rh"],
+                "range_low": ex["rl"],
+                "started": ex["start_idx"] and
+                          candles_5m[ex["start_idx"]]["t"] / 1000.0 or time.time(),
+                "growth_24h": g1h["growth_24h"],
+                "pullback": pullback,
+                "volume_24h": volume,
+                "candles_in_range": 0,
+            }
+            add_bit_history(sym, fake_state, ex["exit_price"])
+        except Exception as e:
+            worker_log(f"[v1.4.0] bit_history error {sym}: {e}")
+
+    if active_start is None:
+        # нет активного диапазона
+        return None
+
+    start_idx = active_start
 
     subset = list(candles_5m)[start_idx:]
     if len(subset) < cfg["range_forming_min_candles"]:
@@ -806,8 +899,10 @@ def update_state(sym, state, k):
         state["last_touch"] = now
         state["touch_count"] += 1
 
-    broke_up = high > state["range_high"]
-    broke_down = low < state["range_low"]
+    # v1.4.0: порог выхода 5%
+    breakout_th = cfg.get("breakout_threshold_pct", 5.0) / 100.0
+    broke_up = high > state["range_high"] * (1 + breakout_th)
+    broke_down = low < state["range_low"] * (1 - breakout_th)
 
     if broke_up or broke_down:
         side = "up" if broke_up else "down"
@@ -1545,6 +1640,9 @@ class SqueezeWidget(ctk.CTk):
         y = (sh - total_h) // 2
         self.geometry(f"{self.WIDTH}x{total_h}+{x}+{y}")
 
+        # v1.3.5: окно в Alt+Tab и панели задач
+        self._setup_alt_tab()
+
         self.history = deque(maxlen=cfg["history_size"])
         self.paused = False
         self.collapsed = False
@@ -1574,6 +1672,27 @@ class SqueezeWidget(ctk.CTk):
         self.bit_window = None   # ссылка на окно БИТ
         self._last_render_hash = None   # v1.3.4: для фикса мерцания
         self.poll()
+
+    def _setup_alt_tab(self):
+        """v1.3.5: добавляет окно в Alt+Tab и панель задач."""
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            # пересоздать окно, чтобы Windows применила стиль
+            self.withdraw()
+            self.after(50, self.deiconify)
+            worker_log(f"[alt_tab] applied, hwnd={hwnd}")
+        except Exception as e:
+            worker_log(f"[alt_tab] error: {e}")
 
     def _build_header(self):
         h = ctk.CTkFrame(self.main, fg_color=BG_DARK, height=self.HEADER_H,
@@ -2133,7 +2252,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.3.4 ===")
+    worker_log("=== start v1.4.0 ===")
 
     if "--test" in sys.argv:
         inject_test()
