@@ -1,22 +1,15 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.3.4 — крупная версия, фикс мерцания, копирование тикера
+Версия 2.0.0 — чистая архитектура: активные диапазоны + история БИТ
 
 Changelog:
-    1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
-    1.3.1 — squeeze_filters.txt (читается поверх конфига)
-            фикс: pullback ищет хай на 5m (не на 1H)
-            фикс: is_trend (тренд vs диапазон)
-            секция "БИТ СРАБОТАЛ" + squeeze_bit_history.csv
-            отдельное окно "Отработанные БИТ"
-    1.3.2 — фикс: алерт при первом появлении активной монеты
-            фикс: границы диапазона фиксированы (не сжимаются)
-    1.3.3 — is_trend больше не отсеивает, а помечает монету
-            метка «возможно тренд» в UI
-            номер версии внизу окна
-    1.3.4 — версия крупнее и золотая
-            фикс мерцания (хэш-сравнение, перерисовка раз в минуту)
-            ЛКМ по тикеру копирует полный символ (GTCUSDT) в буфер
+    1.0–1.3 — эволюция, фиксы
+    1.4.x — попытка с find_active_range (провалилась)
+    2.0.0 — ПОЛНАЯ ПЕРЕРАБОТКА:
+        Механизм 1: активные диапазоны (поиск начала + отслеживание)
+        Механизм 2: история БИТ (паттерн-матчинг 24ч)
+        Оба механизма независимы
+        Убраны find_active_range, t_high, is_trend
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -31,7 +24,6 @@ import time
 import urllib.request
 import winsound
 from collections import deque
-from datetime import datetime
 from urllib.parse import quote
 
 import websocket
@@ -46,17 +38,15 @@ CONFIG_PATH = os.path.join(BASE_DIR, "squeeze_config.json")
 FILTERS_PATH = os.path.join(BASE_DIR, "squeeze_filters.txt")
 CACHE_PATH = os.path.join(BASE_DIR, "squeeze_cache.json")
 LOG_PATH = os.path.join(BASE_DIR, "squeeze_log.csv")
-BIT_LOG_PATH = os.path.join(BASE_DIR, "squeeze_bit_signals.csv")
 BIT_HISTORY_PATH = os.path.join(BASE_DIR, "squeeze_bit_history.csv")
 EXPIRED_LOG_PATH = os.path.join(BASE_DIR, "squeeze_expired.csv")
 WORKER_LOG_PATH = os.path.join(BASE_DIR, "squeeze_worker.log")
 LAST_SEEN_PATH = os.path.join(BASE_DIR, "last_seen_squeeze.txt")
 SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
-DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
+DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-# версия виджета — отображается внизу окна
-WIDGET_VERSION = "1.3.4"
+WIDGET_VERSION = "2.0.0"
 
 
 # ============ ЦВЕТА ============
@@ -72,40 +62,42 @@ MINT         = "#D1E8E2"
 GREEN        = "#4ADE80"
 RED          = "#EF4444"
 GREY         = "#6B7772"
-GOLD         = "#FFD166"   # для "БИТ сработал"
+GOLD         = "#FFD166"
 
 
 # ============ НАСТРОЙКИ ============
 DEFAULTS = {
-    # Фильтр свежести (на 1H)
+    # Фильтр свежести
     "growth_24h_min_pct": 20.0,
-    "pullback_min_pct": 0.0,
-    "max_pullback_ratio": 0.7,
     "volume_24h_min_usdt": 10_000_000,
 
-    # Фильтр ширины
-    "range_width_k1": 0.5,
+    # Фильтр ширины диапазона
+    "range_width_k1": 0.8,
     "range_width_abs_max_pct": 20.0,
     "min_range_width_pct": 0.1,
 
     # Диапазон
-    "range_forming_min_candles": 5,
+    "range_forming_min_candles": 6,
     "range_active_min_candles": 6,
-    "local_min_window": 2,
 
-    # Тренд vs диапазон
-    "trend_check_candles": 5,
-    "trend_check_max_new_highs": 3,
-
-    # Касания и выносы
+    # Касания/выносы
     "touch_gap_pct": 0.2,
     "breakout_exit_candles": 6,
-    "breakout_exit_distance_pct": 1.0,
+
+    # Затянувшийся
+    "long_range_hours": 15,
+
+    # Задний двор
     "backstage_ttl_hours": 12,
 
-    # "БИТ сработал" — сколько держать в истории
-    "bit_history_ttl_hours": 72,        # 3 дня
+    # История БИТ
+    "bit_history_ttl_hours": 72,
     "bit_history_max_rows": 200,
+    "bit_pattern_growth_min_pct": 20.0,
+    "bit_pattern_pullback_min_pct": 5.0,
+    "bit_pattern_range_min_candles": 5,
+    "bit_pattern_exit_candles": 6,
+    "bit_pattern_exit_pct": 5.0,
 
     # UI
     "forming_max_show": 5,
@@ -128,16 +120,15 @@ DEFAULTS = {
 # параметры, которые можно менять в squeeze_filters.txt
 FILTER_KEYS = [
     "growth_24h_min_pct",
-    "pullback_min_pct",
-    "max_pullback_ratio",
     "volume_24h_min_usdt",
     "range_width_k1",
     "range_width_abs_max_pct",
     "min_range_width_pct",
     "range_forming_min_candles",
     "range_active_min_candles",
-    "trend_check_candles",
-    "trend_check_max_new_highs",
+    "touch_gap_pct",
+    "breakout_exit_candles",
+    "long_range_hours",
 ]
 
 REST_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -160,19 +151,17 @@ status = {
     "stats_fresh": 0,
     "stats_range": 0,
     "fail_growth": 0,
-    "fail_pullback_ratio": 0,
     "fail_volume": 0,
     "fail_width_k1": 0,
     "fail_width_abs": 0,
     "fail_width_min": 0,
-    "fail_trend": 0,
 }
 
 buf_5m: dict = {}
 buf_1h: dict = {}
-squeeze_state: dict = {}    # активные + формирующиеся + broken
-backstage: dict = {}        # ушла вниз или не вернулась
-bit_history: list = []      # отработанные БИТ (вверх)
+squeeze_state: dict = {}       # активные диапазоны
+backstage: dict = {}           # задний двор
+bit_history: list = []         # история БИТ
 bit_history_lock = threading.Lock()
 
 cfg = dict(DEFAULTS)
@@ -201,55 +190,40 @@ def fmt_duration(sec):
 
 
 def _make_filters_txt():
-    """Создаёт squeeze_filters.txt с комментариями, если его нет."""
     if os.path.exists(FILTERS_PATH):
         return
     content = """# ============================================================
-# SQUEEZE WIDGET — НАСТРОЙКИ ФИЛЬТРОВ
+# SQUEEZE WIDGET v2.0.0 — НАСТРОЙКИ ФИЛЬТРОВ
 # Меняй значения, сохраняй, перезапускай виджет.
 # Строки с # — комментарии.
 # ============================================================
 
 # ------------------------------------------------------------
-# ФИЛЬТР СВЕЖЕСТИ (на 1H — часовике)
+# ФИЛЬТР СВЕЖЕСТИ
 # ------------------------------------------------------------
 
-# Минимальный рост монеты за 24 часа (в %).
-# Меньше этого — не БИТ, отсеиваем.
-# Больше -> меньше монет. Меньше -> больше монет (и мусора).
+# Минимальный рост монеты за 24ч (в %).
 # Дефолт: 20
 growth_24h_min_pct = 20
 
-# Максимальный откат от хая (в долях роста).
-# 0.7 = откат не больше 70% роста. Иначе — слила слишком много.
-# Больше -> мягче. Меньше -> строже.
-# Дефолт: 0.7
-max_pullback_ratio = 0.7
-
-# Минимальный оборот за 24ч (в USDT).
-# Меньше — мало ликвидности, пропускаем.
-# Дефолт: 10000000 (10M)
+# Минимальный оборот за 24ч (USDT).
+# Дефолт: 10000000
 volume_24h_min_usdt = 10000000
 
-# Минимальный откат (в %). 0 = фильтр выключен.
-# Дефолт: 0
-pullback_min_pct = 0
-
 # ------------------------------------------------------------
-# ФИЛЬТР ШИРИНЫ ДИАПАЗОНА (на 5m)
+# ФИЛЬТР ШИРИНЫ ДИАПАЗОНА
 # ------------------------------------------------------------
 
 # Ширина диапазона <= рост * этот коэффициент.
-# 0.5 = диапазон не больше половины роста.
-# Больше -> мягче. Меньше -> строже.
-# Дефолт: 0.5
-range_width_k1 = 0.5
+# 0.8 = диапазон не больше 80% роста.
+# Дефолт: 0.8
+range_width_k1 = 0.8
 
-# Абсолютный потолок ширины (в %). Защита от "диапазон 40%".
+# Абсолютный потолок ширины (%).
 # Дефолт: 20
 range_width_abs_max_pct = 20
 
-# Минимальная ширина (в %). Ниже — это шум, не диапазон.
+# Минимальная ширина (%).
 # Дефолт: 0.1
 min_range_width_pct = 0.1
 
@@ -257,27 +231,25 @@ min_range_width_pct = 0.1
 # ДИАПАЗОН
 # ------------------------------------------------------------
 
-# Свечей 5m для "формирующегося" диапазона. 5 = 25 минут.
-# Дефолт: 5
-range_forming_min_candles = 5
+# Минимум свечей для диапазона.
+# Дефолт: 6
+range_forming_min_candles = 6
 
-# Свечей 5m для "активного" диапазона. 6 = 30 минут.
+# Свечей для "активного" диапазона.
 # Дефолт: 6
 range_active_min_candles = 6
 
-# ------------------------------------------------------------
-# ТРЕНД vs ДИАПАЗОН
-# ------------------------------------------------------------
+# Зазор для касания границы (%).
+# Дефолт: 0.2
+touch_gap_pct = 0.2
 
-# Сколько последних свечей проверять на тренд.
-# Дефолт: 5
-trend_check_candles = 5
+# Свечей подряд close вне диапазона для ухода.
+# Дефолт: 6
+breakout_exit_candles = 6
 
-# Сколько new high (или new low) допустимо в этих свечах.
-# Если больше — это тренд, не создаём диапазон.
-# Больше -> мягче. Меньше -> строже.
-# Дефолт: 3
-trend_check_max_new_highs = 3
+# Порог "затянувшегося" диапазона (часы).
+# Дефолт: 15
+long_range_hours = 15
 """
     try:
         with open(FILTERS_PATH, "w", encoding="utf-8") as f:
@@ -287,7 +259,6 @@ trend_check_max_new_highs = 3
 
 
 def load_config():
-    """Читает squeeze_config.json, потом поверх — squeeze_filters.txt."""
     global cfg
     if os.path.exists(CONFIG_PATH):
         try:
@@ -299,7 +270,6 @@ def load_config():
 
     _make_filters_txt()
 
-    # читаем фильтры
     if os.path.exists(FILTERS_PATH):
         try:
             with open(FILTERS_PATH, "r", encoding="utf-8") as f:
@@ -314,14 +284,13 @@ def load_config():
                     val = val.strip()
                     if key not in FILTER_KEYS:
                         continue
-                    # пытаемся преобразовать в число
                     try:
                         if "." in val:
                             cfg[key] = float(val)
                         else:
                             cfg[key] = int(val)
                     except ValueError:
-                        print(f"filters.txt: bad value for {key}: {val}")
+                        print(f"filters.txt: bad value {key}={val}")
         except Exception as e:
             print("filters.txt load error:", e)
 
@@ -347,7 +316,7 @@ def log_squeeze(sym, state):
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             if new:
                 f.write("created;symbol;range_high;range_low;width_pct;"
-                        "growth_24h;pullback;volume_24h\n")
+                        "growth_24h;volume_24h\n")
             now = time.time()
             width = (state["range_high"] / state["range_low"] - 1) * 100 \
                 if state["range_low"] > 0 else 0
@@ -357,18 +326,36 @@ def log_squeeze(sym, state):
                 f"{state['range_low']:.8f}",
                 f"{width:.4f}",
                 f"{state.get('growth_24h', 0):.2f}",
-                f"{state.get('pullback', 0):.2f}",
                 f"{state.get('volume_24h', 0):.0f}")) + "\n")
     except Exception as e:
         print("log_squeeze error:", e)
 
 
+def log_expired(sym, state, reason, final_price):
+    try:
+        new = not os.path.exists(EXPIRED_LOG_PATH)
+        with open(EXPIRED_LOG_PATH, "a", encoding="utf-8") as f:
+            if new:
+                f.write("ended;symbol;reason;range_high;range_low;"
+                        "duration_sec;final_price\n")
+            now = time.time()
+            f.write(";".join(str(x) for x in (
+                _ts(now), sym, reason,
+                f"{state['range_high']:.8f}",
+                f"{state['range_low']:.8f}",
+                int(now - state.get("started", now)),
+                f"{final_price:.8f}")) + "\n")
+    except Exception as e:
+        print("log_expired error:", e)
+
+
 # ============ ИСТОРИЯ БИТ ============
 def _bit_history_header():
     return [
-        "symbol", "detected_at", "fired_at", "duration_in_range_sec",
-        "range_high", "range_low", "width_pct",
-        "growth_24h", "pullback", "volume_24h",
+        "symbol", "detected_at", "fired_at",
+        "duration_in_range_sec",
+        "range_low", "range_high", "width_pct",
+        "growth_24h", "volume_24h",
         "exit_price",
         "max_after_1h", "max_after_6h", "max_after_24h",
         "pct_after_1h", "pct_after_6h", "pct_after_24h",
@@ -377,7 +364,6 @@ def _bit_history_header():
 
 
 def save_bit_history():
-    """Сохраняет всю историю в CSV."""
     try:
         with open(BIT_HISTORY_PATH, "w", encoding="utf-8",
                   newline="") as f:
@@ -391,7 +377,6 @@ def save_bit_history():
 
 
 def load_bit_history():
-    """Загружает историю из CSV при старте."""
     global bit_history
     if not os.path.exists(BIT_HISTORY_PATH):
         return
@@ -400,15 +385,14 @@ def load_bit_history():
             r = csv.DictReader(f, delimiter=";")
             rows = []
             for row in r:
-                # преобразуем числовые поля
                 for k in ("duration_in_range_sec",):
                     if row.get(k):
                         try:
                             row[k] = int(float(row[k]))
                         except Exception:
                             row[k] = 0
-                for k in ("range_high", "range_low", "width_pct",
-                          "growth_24h", "pullback", "volume_24h",
+                for k in ("range_low", "range_high", "width_pct",
+                          "growth_24h", "volume_24h",
                           "exit_price", "max_after_1h", "max_after_6h",
                           "max_after_24h", "pct_after_1h",
                           "pct_after_6h", "pct_after_24h"):
@@ -425,34 +409,50 @@ def load_bit_history():
         worker_log(f"load_bit_history error: {e}")
 
 
-def add_bit_history(sym, state, exit_price):
-    """Добавляет новую запись в историю БИТ."""
-    now = time.time()
-    width = (state["range_high"] / state["range_low"] - 1) * 100 \
-        if state["range_low"] > 0 else 0
-    row = {
-        "symbol": sym,
-        "detected_at": _ts(state.get("started", now)),
-        "fired_at": _ts(now),
-        "duration_in_range_sec": int(now - state.get("started", now)),
-        "range_high": state["range_high"],
-        "range_low": state["range_low"],
-        "width_pct": width,
-        "growth_24h": state.get("growth_24h", 0),
-        "pullback": state.get("pullback", 0),
-        "volume_24h": state.get("volume_24h", 0),
-        "exit_price": exit_price,
-        "max_after_1h": 0.0,
-        "max_after_6h": 0.0,
-        "max_after_24h": 0.0,
-        "pct_after_1h": 0.0,
-        "pct_after_6h": 0.0,
-        "pct_after_24h": 0.0,
-        "status": "fired",
-    }
+def add_bit_history(sym, state, exit_price, fired_ts=None):
+    """
+    Добавляет запись в историю БИТ.
+    Дедупликация по (symbol, fired_ts до минуты).
+    """
+    if fired_ts is None:
+        fired_ts = time.time()
+
+    exit_key = int(fired_ts // 60)
     with bit_history_lock:
+        for existing in bit_history:
+            ex_ts = existing.get("fired_ts", 0)
+            try:
+                ex_ts = float(ex_ts)
+            except Exception:
+                ex_ts = 0
+            if existing.get("symbol") == sym and \
+               int(ex_ts // 60) == exit_key:
+                worker_log(f"[v2.0.0] dedup {sym} {exit_key}")
+                return None
+
+        width = (state["range_high"] / state["range_low"] - 1) * 100 \
+            if state["range_low"] > 0 else 0
+        row = {
+            "symbol": sym,
+            "detected_at": _ts(state.get("started", fired_ts)),
+            "fired_at": _ts(fired_ts),
+            "fired_ts": fired_ts,
+            "duration_in_range_sec": int(fired_ts - state.get("started", fired_ts)),
+            "range_low": state.get("range_low", 0),
+            "range_high": state.get("range_high", 0),
+            "width_pct": width,
+            "growth_24h": state.get("growth_24h", 0),
+            "volume_24h": state.get("volume_24h", 0),
+            "exit_price": exit_price,
+            "max_after_1h": 0.0,
+            "max_after_6h": 0.0,
+            "max_after_24h": 0.0,
+            "pct_after_1h": 0.0,
+            "pct_after_6h": 0.0,
+            "pct_after_24h": 0.0,
+            "status": "fired",
+        }
         bit_history.append(row)
-        # обрезаем
         if len(bit_history) > cfg["bit_history_max_rows"]:
             del bit_history[:len(bit_history) - cfg["bit_history_max_rows"]]
     save_bit_history()
@@ -460,10 +460,7 @@ def add_bit_history(sym, state, exit_price):
 
 
 def update_bit_history_stats():
-    """
-    Периодически обновляет max_after_* для старых записей БИТ.
-    Считаем от buf_5m: после fired_at ищем максимум high за 1ч/6ч/24ч.
-    """
+    """Раз в минуту обновляет max_after_* для старых записей."""
     now = time.time()
     updated = False
     with bit_history_lock:
@@ -472,51 +469,44 @@ def update_bit_history_stats():
             if not sym or sym not in buf_5m:
                 continue
             try:
-                fired_ts = time.mktime(time.strptime(row["fired_at"],
-                                                    "%Y-%m-%d %H:%M:%S"))
+                fired_ts = float(row.get("fired_ts", 0))
             except Exception:
                 continue
-            exit_price = row.get("exit_price", 0)
-            if exit_price <= 0:
+            if fired_ts <= 0:
                 continue
-
+            exit_price = row.get("exit_price", 0)
+            if not exit_price or exit_price <= 0:
+                continue
             buf = buf_5m.get(sym)
             if not buf:
                 continue
 
-            # собираем high после fired_ts
-            highs_after = [c["high"] for c in buf
-                           if c["t"] / 1000.0 >= fired_ts]
-            if not highs_after:
-                continue
-
-            # для 1ч
-            if now - fired_ts >= 3600 and not row.get("max_after_1h"):
-                hs_1h = [h for c, h in zip(
-                    [x for x in buf if x["t"] / 1000.0 >= fired_ts],
-                    highs_after) if c["t"] / 1000.0 <= fired_ts + 3600]
-                if hs_1h:
-                    mx = max(hs_1h)
+            # 1ч
+            if now - fired_ts >= 3600 and not row.get("pct_after_1h"):
+                hs = [c["high"] for c in buf
+                      if fired_ts <= c["t"] / 1000.0 <= fired_ts + 3600]
+                if hs:
+                    mx = max(hs)
                     row["max_after_1h"] = mx
                     row["pct_after_1h"] = (mx / exit_price - 1) * 100
                     updated = True
 
-            # для 6ч
-            if now - fired_ts >= 6 * 3600 and not row.get("max_after_6h"):
-                hs_6h = [c["high"] for c in buf
-                         if fired_ts <= c["t"] / 1000.0 <= fired_ts + 6 * 3600]
-                if hs_6h:
-                    mx = max(hs_6h)
+            # 6ч
+            if now - fired_ts >= 6 * 3600 and not row.get("pct_after_6h"):
+                hs = [c["high"] for c in buf
+                      if fired_ts <= c["t"] / 1000.0 <= fired_ts + 6 * 3600]
+                if hs:
+                    mx = max(hs)
                     row["max_after_6h"] = mx
                     row["pct_after_6h"] = (mx / exit_price - 1) * 100
                     updated = True
 
-            # для 24ч
-            if now - fired_ts >= 24 * 3600 and not row.get("max_after_24h"):
-                hs_24h = [c["high"] for c in buf
-                          if fired_ts <= c["t"] / 1000.0 <= fired_ts + 24 * 3600]
-                if hs_24h:
-                    mx = max(hs_24h)
+            # 24ч
+            if now - fired_ts >= 24 * 3600 and not row.get("pct_after_24h"):
+                hs = [c["high"] for c in buf
+                      if fired_ts <= c["t"] / 1000.0 <= fired_ts + 24 * 3600]
+                if hs:
+                    mx = max(hs)
                     row["max_after_24h"] = mx
                     row["pct_after_24h"] = (mx / exit_price - 1) * 100
                     updated = True
@@ -527,7 +517,7 @@ def update_bit_history_stats():
 
 # ============ ДЕТЕКТОР ============
 def calc_growth_1h(candles_1h):
-    """Считает рост за 24ч на 1H. idx_high — последний."""
+    """Рост за 24ч по 1H."""
     if not candles_1h or len(candles_1h) < 4:
         return None
     highs = [c["high"] for c in candles_1h]
@@ -537,35 +527,13 @@ def calc_growth_1h(candles_1h):
     if min_low <= 0:
         return None
     growth = (max_high / min_low - 1) * 100
+    # последний индекс хая
     idx_high = len(highs) - 1 - highs[::-1].index(max_high)
     return {
         "growth_24h": growth,
         "high_24h": max_high,
-        "t_high": candles_1h[idx_high]["t"],
+        "t_high_ts": candles_1h[idx_high]["t"] / 1000.0,
     }
-
-
-def calc_pullback_5m(candles_5m, high_24h):
-    """
-    Ищет min(low) на 5m ПОСЛЕ последней 5m-свечи, где high ≈ high_24h.
-    Если хай был на последней свече — откат ещё не начался, возвращаем high_24h.
-    """
-    if not candles_5m or high_24h <= 0:
-        return None
-    # допуск 0.1% — чтобы поймать "почти хай"
-    tolerance = high_24h * 0.999
-    idx_high = None
-    for i in range(len(candles_5m) - 1, -1, -1):
-        if candles_5m[i]["high"] >= tolerance:
-            idx_high = i
-            break
-    if idx_high is None:
-        return None
-    lows_after = [c["low"] for c in list(candles_5m)[idx_high + 1:]]
-    if not lows_after:
-        # хай был недавно — откат ещё не начался
-        return high_24h
-    return min(lows_after)
 
 
 def calc_volume_24h_usdt(candles_5m):
@@ -579,17 +547,10 @@ def calc_volume_24h_usdt(candles_5m):
     return total
 
 
-def is_fresh(growth, pullback, volume):
+def is_fresh(growth, volume):
     if growth < cfg["growth_24h_min_pct"]:
         status["fail_growth"] += 1
         return False, "growth"
-    if cfg["pullback_min_pct"] > 0 and \
-       pullback < cfg["pullback_min_pct"]:
-        status["fail_pullback_ratio"] += 1
-        return False, "pullback_min"
-    if pullback > growth * cfg["max_pullback_ratio"]:
-        status["fail_pullback_ratio"] += 1
-        return False, "pullback_ratio"
     if volume and volume < cfg["volume_24h_min_usdt"]:
         status["fail_volume"] += 1
         return False, "volume"
@@ -609,102 +570,66 @@ def check_range_width(growth, width):
     return True, "ok"
 
 
-def is_trend(candles_5m):
+def find_range_start(candles_5m, t_high_ts):
     """
-    Тренд = последние N свечей сделали >= M new high (или new low).
-    Применяется ТОЛЬКО при создании диапазона.
+    Находит начало диапазона — последний минимум после хая,
+    который не был пробит ниже.
+    Возвращает индекс начала или None.
     """
-    n = cfg["trend_check_candles"]
-    m = cfg["trend_check_max_new_highs"]
-    if len(candles_5m) < n + 1:
-        return False
-    lst = list(candles_5m)
-    prev = lst[-n - 1]
-    new_highs = 0
-    new_lows = 0
-    for c in lst[-n:]:
-        if c["high"] > prev["high"]:
-            new_highs += 1
-        if c["low"] < prev["low"]:
-            new_lows += 1
-        prev = c
-    if new_highs >= m:
-        return True
-    if new_lows >= m:
-        return True
-    return False
-
-
-def find_local_min_start(candles_5m, t_high_ts):
+    # отбираем свечи после хая
     after_high = []
     for i, c in enumerate(candles_5m):
-        if c["t"] >= t_high_ts:
+        if c["t"] / 1000.0 >= t_high_ts:
             after_high.append((i, c))
 
     if len(after_high) < cfg["range_forming_min_candles"]:
         return None
 
-    N = cfg["local_min_window"]
-    candidates = []
-    for k in range(N, len(after_high) - N):
-        orig_i = after_high[k][0]
-        low_k = after_high[k][1]["low"]
-        is_local_min = True
-        for j in range(k - N, k + N + 1):
-            if j == k:
-                continue
-            if after_high[j][1]["low"] < low_k:
-                is_local_min = False
-                break
-        if is_local_min:
-            candidates.append((k, orig_i, low_k))
+    # ищем глобальный минимум после хая — включая заколы
+    min_low = min(c["low"] for _, c in after_high)
+    # последний индекс с этим минимумом
+    min_idx = None
+    for i, c in after_high:
+        if c["low"] == min_low:
+            min_idx = i  # последний — перезаписываем
 
-    if not candidates:
+    if min_idx is None:
         return None
 
-    for k, orig_i, low_k in candidates:
-        broken = False
-        for j in range(orig_i + 1, len(candles_5m)):
-            if candles_5m[j]["low"] < low_k:
-                broken = True
-                break
-        if not broken:
-            return orig_i
+    # проверяем, что после min_idx нет low < min_low
+    for j in range(min_idx + 1, len(candles_5m)):
+        if candles_5m[j]["low"] < min_low:
+            # минимум пробит — сдвигаем
+            min_idx = j
+            min_low = candles_5m[j]["low"]
 
-    return None
+    return min_idx
 
 
-def build_state(sym, candles_5m, candles_1h):
+def build_active_state(sym, candles_5m, candles_1h):
+    """Строит активный диапазон. Возвращает state или None."""
     status["stats_buf"] += 1
-
-    # v1.3.3: НЕ отсеиваем тренд, только помечаем
-    is_trending_flag = is_trend(candles_5m)
 
     g1h = calc_growth_1h(candles_1h)
     if not g1h:
         return None
 
-    low_after_high = calc_pullback_5m(candles_5m, g1h["high_24h"])
-    if low_after_high is None or low_after_high <= 0:
-        return None
-    pullback = (g1h["high_24h"] / low_after_high - 1) * 100
-
     volume = calc_volume_24h_usdt(candles_5m)
-    ok, fail_reason = is_fresh(g1h["growth_24h"], pullback, volume)
+    ok, fail_reason = is_fresh(g1h["growth_24h"], volume)
     if not ok:
         if sym in DEBUG_SYMBOLS:
             worker_log(
-                f"DEBUG {sym}: REJECT at is_fresh/{fail_reason} "
-                f"growth={g1h['growth_24h']:.2f}% "
-                f"pullback={pullback:.2f}% "
-                f"volume={volume:.0f}"
+                f"DEBUG {sym}: REJECT is_fresh/{fail_reason} "
+                f"growth={g1h['growth_24h']:.2f}% volume={volume:.0f}"
             )
         return None
     status["stats_fresh"] += 1
 
-    start_idx = find_local_min_start(candles_5m, g1h["t_high"])
+    # ищем начало диапазона
+    start_idx = find_range_start(candles_5m, g1h["t_high_ts"])
 
     if start_idx is None:
+        # fallback — последние N свечей
         n = cfg["range_forming_min_candles"]
         if len(candles_5m) < n:
             return None
@@ -714,6 +639,7 @@ def build_state(sym, candles_5m, candles_1h):
     if len(subset) < cfg["range_forming_min_candles"]:
         return None
 
+    # границы — по фитилям
     rh = max(c["high"] for c in subset)
     rl = min(c["low"] for c in subset)
     if rl <= 0:
@@ -724,11 +650,9 @@ def build_state(sym, candles_5m, candles_1h):
     if not ok:
         if sym in DEBUG_SYMBOLS:
             worker_log(
-                f"DEBUG {sym}: REJECT at check_range_width/{fail_reason} "
+                f"DEBUG {sym}: REJECT width/{fail_reason} "
                 f"growth={g1h['growth_24h']:.2f}% "
-                f"width={width:.2f}% "
-                f"k1_limit={g1h['growth_24h'] * cfg['range_width_k1']:.2f}% "
-                f"candles={len(subset)}"
+                f"width={width:.2f}% candles={len(subset)}"
             )
         return None
     status["stats_range"] += 1
@@ -736,16 +660,12 @@ def build_state(sym, candles_5m, candles_1h):
     started_ts = subset[0]["t"] / 1000.0
     candles_in_range = len(subset)
 
-    if candles_in_range >= cfg["range_active_min_candles"]:
-        st_status = "active"
-    elif candles_in_range >= cfg["range_forming_min_candles"]:
-        st_status = "forming"
-    else:
+    if candles_in_range < cfg["range_active_min_candles"]:
         return None
 
     now = time.time()
     state = {
-        "status": st_status,
+        "status": "active",
         "range_high": rh,
         "range_low": rl,
         "started": started_ts,
@@ -755,23 +675,19 @@ def build_state(sym, candles_5m, candles_1h):
         "breakout_side": None,
         "touch_count": 0,
         "breakout_count": 0,
+        "exit_candles": 0,        # счётчик close вне
         "growth_24h": g1h["growth_24h"],
-        "pullback": pullback,
-        "high_24h": g1h["high_24h"],
-        "low_after_high": low_after_high,
         "volume_24h": volume,
+        "high_24h": g1h["high_24h"],
         "last_update_ts": now,
-        "is_trending": is_trending_flag,
     }
 
-    if st_status == "active":
-        log_squeeze(sym, state)
+    log_squeeze(sym, state)
 
     if sym in DEBUG_SYMBOLS:
         worker_log(
-            f"DEBUG {sym}: ACCEPT status={st_status} "
+            f"DEBUG {sym}: ACCEPT active "
             f"growth={g1h['growth_24h']:.2f}% "
-            f"pullback={pullback:.2f}% "
             f"width={width:.2f}% "
             f"candles={candles_in_range} "
             f"range=[{rl:.6f}..{rh:.6f}]"
@@ -780,7 +696,11 @@ def build_state(sym, candles_5m, candles_1h):
     return state
 
 
-def update_state(sym, state, k):
+def update_active_state(sym, state, k):
+    """
+    Обновляет состояние активного диапазона.
+    Возвращает event-dict или None.
+    """
     now = time.time()
     close = k["close"]
     high = k["high"]
@@ -790,15 +710,11 @@ def update_state(sym, state, k):
     if sv == "cancelled":
         return None
 
-    # v1.3.2: границы НЕ сжимаем — фиксируем при создании
+    # границы НЕ двигаем — фиксированы
     state["candles_in_range"] += 1
     state["last_update_ts"] = now
 
-    if low < state.get("low_after_high", 999999999):
-        state["low_after_high"] = low
-        if state["high_24h"] > 0:
-            state["pullback"] = (state["high_24h"] / low - 1) * 100
-
+    # касание
     gap = cfg["touch_gap_pct"] / 100.0
     touch_top = high >= state["range_high"] * (1 - gap)
     touch_bot = low <= state["range_low"] * (1 + gap)
@@ -806,8 +722,9 @@ def update_state(sym, state, k):
         state["last_touch"] = now
         state["touch_count"] += 1
 
-    broke_up = high > state["range_high"]
-    broke_down = low < state["range_low"]
+    # вынос по close
+    broke_up = close > state["range_high"]
+    broke_down = close < state["range_low"]
 
     if broke_up or broke_down:
         side = "up" if broke_up else "down"
@@ -815,34 +732,27 @@ def update_state(sym, state, k):
         state["breakout_side"] = side
         state["breakout_count"] += 1
         state["status"] = "broken_up" if broke_up else "broken_down"
+        state["exit_candles"] = 1
         return {"type": "breakout", "symbol": sym,
                 "side": side, "state": state}
 
+    # если в статусе broken — считаем свечи вне
     if sv in ("broken_up", "broken_down"):
-        inside = state["range_low"] <= close <= state["range_high"]
-        if inside:
-            state["status"] = "active" if \
-                state["candles_in_range"] >= cfg["range_active_min_candles"] \
-                else "forming"
+        # проверка возврата
+        if state["range_low"] <= close <= state["range_high"]:
+            state["status"] = "active"
+            state["exit_candles"] = 0
             return {"type": "return", "symbol": sym, "state": state}
-
-    if sv in ("broken_up", "broken_down"):
-        sec_outside = now - state["last_breakout"]
-        candles_outside = sec_outside / 300.0
-        dist_up = (close / state["range_high"] - 1) * 100 \
-            if state["range_high"] > 0 else 0
-        dist_dn = (1 - close / state["range_low"]) * 100 \
-            if state["range_low"] > 0 else 0
-
-        if candles_outside >= cfg["breakout_exit_candles"]:
-            if dist_up >= cfg["breakout_exit_distance_pct"] or \
-               dist_dn >= cfg["breakout_exit_distance_pct"]:
+        else:
+            state["exit_candles"] += 1
+            if state["exit_candles"] >= cfg["breakout_exit_candles"]:
+                # уход
                 state["status"] = "cancelled"
                 state["left_at"] = now
                 state["left_reason"] = sv
                 if sv == "broken_up":
-                    # БИТ СРАБОТАЛ
-                    add_bit_history(sym, state, close)
+                    # БИТ сработал
+                    add_bit_history(sym, state, close, fired_ts=now)
                     return {"type": "bit_signal", "symbol": sym,
                             "state": state}
                 else:
@@ -853,12 +763,6 @@ def update_state(sym, state, k):
                     }
                     return {"type": "cancelled", "symbol": sym,
                             "state": state}
-
-    if sv == "forming":
-        if state["candles_in_range"] >= cfg["range_active_min_candles"]:
-            state["status"] = "active"
-            log_squeeze(sym, state)
-            return {"type": "new_active", "symbol": sym, "state": state}
 
     return None
 
@@ -874,9 +778,8 @@ def check_backstage_return(sym, k):
     if rl <= 0 or rh <= 0:
         return None
     if rl <= close <= rh:
-        state["status"] = "active" if \
-            state["candles_in_range"] >= cfg["range_active_min_candles"] \
-            else "forming"
+        state["status"] = "active"
+        state["exit_candles"] = 0
         state["last_update_ts"] = time.time()
         squeeze_state[sym] = state
         del backstage[sym]
@@ -911,6 +814,7 @@ def handle_kline_5m(sym, k):
     state = squeeze_state.get(sym)
 
     if state is None:
+        # сначала задний двор
         ev = check_backstage_return(sym, {"high": high, "low": low,
                                           "close": close, "open": open_,
                                           "volume": volume,
@@ -923,22 +827,120 @@ def handle_kline_5m(sym, k):
         candles_1h = buf_1h.get(sym)
         if not candles_1h or len(candles_1h) < 4:
             return
-        new_state = build_state(sym, buf, candles_1h)
+        new_state = build_active_state(sym, buf, candles_1h)
         if new_state:
             squeeze_state[sym] = new_state
-            # v1.3.2: правильный тип события при первом появлении
-            ev_type = "new_active" if new_state["status"] == "active" \
-                else "forming"
-            alerts_q.put({"type": ev_type, "symbol": sym,
+            alerts_q.put({"type": "new_active", "symbol": sym,
                           "state": new_state})
         return
 
-    ev = update_state(sym, state, {"high": high, "low": low,
-                                   "close": close, "open": open_,
-                                   "volume": volume,
-                                   "quote_volume": quote_volume, "t": t})
+    ev = update_active_state(sym, state, {"high": high, "low": low,
+                                          "close": close, "open": open_,
+                                          "volume": volume,
+                                          "quote_volume": quote_volume,
+                                          "t": t})
     if ev:
         alerts_q.put(ev)
+
+
+# ============ МЕХАНИЗМ 2: ИСТОРИЯ БИТ ============
+def find_bit_patterns(sym, candles_5m, candles_1h):
+    """
+    Ищет паттерны БИТ в буфере 24ч.
+    Возвращает список найденных паттернов.
+    """
+    patterns = []
+    if len(candles_5m) < 50:
+        return patterns
+
+    g1h = calc_growth_1h(candles_1h)
+    if not g1h:
+        return patterns
+    if g1h["growth_24h"] < cfg["bit_pattern_growth_min_pct"]:
+        return patterns
+
+    volume = calc_volume_24h_usdt(candles_5m)
+    if volume < cfg["volume_24h_min_usdt"]:
+        return patterns
+
+    # идём по буферу от хая
+    t_high_ts = g1h["t_high_ts"]
+
+    # ищем начало диапазона
+    start_idx = find_range_start(candles_5m, t_high_ts)
+    if start_idx is None:
+        return patterns
+
+    subset = list(candles_5m)[start_idx:]
+    if len(subset) < cfg["bit_pattern_range_min_candles"]:
+        return patterns
+
+    rh = max(c["high"] for c in subset)
+    rl = min(c["low"] for c in subset)
+    if rl <= 0:
+        return patterns
+    width = (rh / rl - 1) * 100
+    if width > cfg["range_width_abs_max_pct"]:
+        return patterns
+    if width < cfg["min_range_width_pct"]:
+        return patterns
+    if width > g1h["growth_24h"] * cfg["range_width_k1"]:
+        return patterns
+
+    # ищем выход вверх в subset
+    exit_candles = cfg["bit_pattern_exit_candles"]
+    consecutive_outside = 0
+    fired_ts = None
+    exit_price = None
+
+    for c in subset:
+        if c["close"] > rh:
+            consecutive_outside += 1
+            if consecutive_outside >= exit_candles:
+                fired_ts = c["t"] / 1000.0
+                exit_price = c["close"]
+                break
+        else:
+            consecutive_outside = 0
+
+    if fired_ts is None:
+        return patterns
+
+    # один паттерн на монету
+    pattern = {
+        "started": subset[0]["t"] / 1000.0,
+        "range_low": rl,
+        "range_high": rh,
+        "width_pct": width,
+        "growth_24h": g1h["growth_24h"],
+        "volume_24h": volume,
+        "fired_ts": fired_ts,
+        "exit_price": exit_price,
+    }
+    patterns.append(pattern)
+    return patterns
+
+
+def scan_bit_patterns_for_symbol(sym):
+    """Прогоняет монету через Механизм 2 и записывает найденные БИТ."""
+    c5 = buf_5m.get(sym)
+    c1h = buf_1h.get(sym)
+    if not c5 or not c1h:
+        return
+    try:
+        patterns = find_bit_patterns(sym, c5, c1h)
+        for p in patterns:
+            state_like = {
+                "started": p["started"],
+                "range_low": p["range_low"],
+                "range_high": p["range_high"],
+                "growth_24h": p["growth_24h"],
+                "volume_24h": p["volume_24h"],
+            }
+            add_bit_history(sym, state_like, p["exit_price"],
+                            fired_ts=p["fired_ts"])
+    except Exception as e:
+        worker_log(f"[v2.0.0] scan_bit_patterns error {sym}: {e}")
 
 
 # ============ BINANCE ============
@@ -1010,9 +1012,12 @@ def warmup_symbol(sym):
         buf_1h[sym] = buf
 
     if sym in buf_5m and sym in buf_1h:
-        st = build_state(sym, buf_5m[sym], buf_1h[sym])
+        # Механизм 1 — активный
+        st = build_active_state(sym, buf_5m[sym], buf_1h[sym])
         if st:
             squeeze_state[sym] = st
+        # Механизм 2 — история
+        scan_bit_patterns_for_symbol(sym)
 
 
 def warmup_all(symbols):
@@ -1046,18 +1051,15 @@ def warmup_all(symbols):
     status["text"] = "онлайн"
     active = sum(1 for s in squeeze_state.values()
                  if s.get("status") == "active")
-    forming = sum(1 for s in squeeze_state.values()
-                  if s.get("status") == "forming")
     worker_log(
         f"warmup finished: {done[0]} / {len(symbols)}, "
-        f"active={active}, forming={forming}, "
+        f"active={active}, "
         f"filter: buf={status['stats_buf']}, "
         f"fresh={status['stats_fresh']}, "
         f"range={status['stats_range']}, "
         f"fail_growth={status['fail_growth']}, "
-        f"fail_pullback_ratio={status['fail_pullback_ratio']}, "
         f"fail_volume={status['fail_volume']}, "
-        f"fail_trend={status['fail_trend']}"
+        f"fail_width_k1={status['fail_width_k1']}"
     )
 
 
@@ -1132,7 +1134,7 @@ def manager():
 def save_cache():
     try:
         data = {
-            "version": 7,
+            "version": 100,   # v2.0.0
             "saved_at": time.time(),
             "squeeze_state": squeeze_state,
             "backstage": backstage,
@@ -1150,7 +1152,7 @@ def load_cache():
     try:
         with open(CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("version") != 7:
+        if data.get("version") != 100:
             worker_log(f"cache version mismatch, skipping")
             return
         squeeze_state.update(data.get("squeeze_state", {}))
@@ -1188,8 +1190,6 @@ def stats_loop():
         time.sleep(60)
         active = sum(1 for s in squeeze_state.values()
                      if s.get("status") == "active")
-        forming = sum(1 for s in squeeze_state.values()
-                      if s.get("status") == "forming")
         broken = sum(1 for s in squeeze_state.values()
                      if s.get("status", "").startswith("broken"))
         worker_log(
@@ -1197,20 +1197,17 @@ def stats_loop():
             f"filter: buf={status['stats_buf']}, "
             f"fresh={status['stats_fresh']}, "
             f"range={status['stats_range']}, "
-            f"active={active}, forming={forming}, broken={broken}, "
+            f"active={active}, broken={broken}, "
             f"backstage={len(backstage)}, "
             f"bit_history={len(bit_history)}"
         )
         worker_log(
             f"filter_debug: growth_fail={status['fail_growth']}, "
-            f"pullback_ratio_fail={status['fail_pullback_ratio']}, "
             f"volume_fail={status['fail_volume']}, "
             f"width_k1_fail={status['fail_width_k1']}, "
             f"width_abs_fail={status['fail_width_abs']}, "
-            f"width_min_fail={status['fail_width_min']}, "
-            f"trend_fail={status['fail_trend']}"
+            f"width_min_fail={status['fail_width_min']}"
         )
-        # обновляем статистику БИТ
         try:
             update_bit_history_stats()
         except Exception as e:
@@ -1240,16 +1237,18 @@ def _beep_fallback():
         winsound.Beep(1400, 100)
     except Exception:
         pass
-    # ============ UI ============
+
+
+# ============ UI ============
 class LegendBar(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color=BG, height=18, corner_radius=0)
         self.pack_propagate(False)
         items = [
-            ("○", SAND, "формируется"),
             ("●", PEACH, "активен"),
             ("●", GREEN, "вынос вверх"),
             ("●", RED, "вынос вниз"),
+            ("●", GREY, "затянувшийся"),
             ("★", GOLD, "БИТ сработал"),
         ]
         for i, (ch, color, text) in enumerate(items):
@@ -1304,23 +1303,23 @@ class AlertPopup(ctk.CTkToplevel):
         lbl_sub.pack(anchor="w")
 
 
-# ============ ОКНО "ОТРАБОТАННЫЕ БИТ" ============
+# ============ ОКНО ИСТОРИИ БИТ ============
 class BitHistoryWindow(ctk.CTkToplevel):
     WIDTH = 1100
     HEIGHT = 600
 
     COLUMNS = [
-        ("ТИКЕР",       90),
-        ("ОБНАРУЖЕН",   140),
-        ("СРАБОТАЛ",    140),
-        ("В ДИАП",      80),
-        ("ШИРИНА",      70),
-        ("РОСТ",        70),
-        ("ОТКАТ",       70),
-        ("ЦЕНА ВЫХ",    100),
-        ("+1ч",         80),
-        ("+6ч",         80),
-        ("+24ч",        80),
+        ("ТИКЕР",       80),
+        ("ОБНАРУЖЕН",   130),
+        ("СРАБОТАЛ",    130),
+        ("В ДИАП",      70),
+        ("ДИАПАЗОН",    180),
+        ("ШИРИНА",      65),
+        ("РОСТ",        60),
+        ("ЦЕНА ВЫХ",    90),
+        ("+1ч",         60),
+        ("+6ч",         60),
+        ("+24ч",        60),
     ]
 
     def __init__(self, parent):
@@ -1330,19 +1329,14 @@ class BitHistoryWindow(ctk.CTkToplevel):
         self.configure(fg_color=BG)
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.resizable(True, True)
-
-        # позиция — по центру родителя, чуть смещено
         px = parent.winfo_x()
         py = parent.winfo_y()
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{px + 60}+{py + 60}")
-
         self._build()
         self.refresh()
-        # авто-обновление раз в 10 сек
         self._auto_refresh()
 
     def _build(self):
-        # шапка
         head = ctk.CTkFrame(self, fg_color=BG_DARK, height=48,
                             corner_radius=0)
         head.pack(fill="x")
@@ -1383,19 +1377,16 @@ class BitHistoryWindow(ctk.CTkToplevel):
                                     command=self.refresh)
         btn_refresh.pack(side="right", padx=4)
 
-        # заголовок колонок
         colhead = ctk.CTkFrame(self, fg_color=BG_DARK, height=28,
                                corner_radius=0)
         colhead.pack(fill="x", padx=8, pady=(4, 0))
         colhead.pack_propagate(False)
-
         for name, w in self.COLUMNS:
             lbl = ctk.CTkLabel(colhead, text=name,
                                font=("Segoe UI", 10, "bold"),
                                text_color=SAND, width=w, anchor="w")
             lbl.pack(side="left", padx=(4, 0))
 
-        # скроллируемая область
         self.scroll_frame = ctk.CTkScrollableFrame(self, fg_color=BG,
                                                     corner_radius=0)
         self.scroll_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1420,16 +1411,12 @@ class BitHistoryWindow(ctk.CTkToplevel):
             worker_log(f"export_csv error: {e}")
 
     def refresh(self):
-        # чистим
         for w in self.scroll_frame.winfo_children():
             w.destroy()
-
         with bit_history_lock:
             rows = list(bit_history)
-
         self.count_label.configure(text=f"всего: {len(rows)}")
-        rows = list(reversed(rows))   # свежие сверху
-
+        rows = list(reversed(rows))
         if not rows:
             lbl = ctk.CTkLabel(self.scroll_frame,
                                text="Пока нет отработанных БИТ",
@@ -1437,7 +1424,6 @@ class BitHistoryWindow(ctk.CTkToplevel):
                                text_color=GREY)
             lbl.pack(pady=40)
             return
-
         for i, row in enumerate(rows):
             self._build_row(row, i)
 
@@ -1450,32 +1436,36 @@ class BitHistoryWindow(ctk.CTkToplevel):
 
         sym = row.get("symbol", "")
         ticker = sym.replace("USDT", "")
-
         detected = row.get("detected_at", "")
         fired = row.get("fired_at", "")
         duration_sec = row.get("duration_in_range_sec", 0)
+        range_high = row.get("range_high", 0)
+        range_low = row.get("range_low", 0)
         width = row.get("width_pct", 0)
         growth = row.get("growth_24h", 0)
-        pullback = row.get("pullback", 0)
         exit_price = row.get("exit_price", 0)
         pct_1h = row.get("pct_after_1h", 0)
         pct_6h = row.get("pct_after_6h", 0)
         pct_24h = row.get("pct_after_24h", 0)
+
+        if range_low and range_high:
+            rng_str = f"{range_low:.4f} — {range_high:.4f}"
+        else:
+            rng_str = "—"
 
         values = [
             (ticker, GOLD, "bold"),
             (detected[:16] if detected else "—", MINT, "normal"),
             (fired[:16] if fired else "—", MINT, "normal"),
             (fmt_duration(duration_sec), MINT, "normal"),
+            (rng_str, MINT, "normal"),
             (f"{width:.2f}%" if width else "—", PEACH, "bold"),
             (f"{growth:.1f}%" if growth else "—", SAND, "normal"),
-            (f"{pullback:.1f}%" if pullback else "—", SAND, "normal"),
             (f"{exit_price:.6f}" if exit_price else "—", MINT, "normal"),
             (self._pct_str(pct_1h), self._pct_color(pct_1h), "bold"),
             (self._pct_str(pct_6h), self._pct_color(pct_6h), "bold"),
             (self._pct_str(pct_24h), self._pct_color(pct_24h), "bold"),
         ]
-
         for (name, w), (val, color, weight) in zip(self.COLUMNS, values):
             lbl = ctk.CTkLabel(row_frame, text=str(val),
                                font=("Segoe UI", 10, weight),
@@ -1517,7 +1507,7 @@ class SqueezeWidget(ctk.CTk):
     COL_HEADER_H = 26
     ROW_H = 32
     SECTION_H = 20
-    TABLE_H = ROW_H * 10 + SECTION_H * 4   # 4 секции
+    TABLE_H = ROW_H * 10 + SECTION_H * 4
     IDLE_H = 60
 
     COLUMNS = [
@@ -1545,6 +1535,8 @@ class SqueezeWidget(ctk.CTk):
         y = (sh - total_h) // 2
         self.geometry(f"{self.WIDTH}x{total_h}+{x}+{y}")
 
+        self._setup_alt_tab()
+
         self.history = deque(maxlen=cfg["history_size"])
         self.paused = False
         self.collapsed = False
@@ -1553,6 +1545,7 @@ class SqueezeWidget(ctk.CTk):
         self._dx = 0
         self._dy = 0
         self.last_draw = 0.0
+        self._last_render_hash = None
 
         self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=10)
         self.main.pack(fill="both", expand=True)
@@ -1571,9 +1564,27 @@ class SqueezeWidget(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.active_popups = []
-        self.bit_window = None   # ссылка на окно БИТ
-        self._last_render_hash = None   # v1.3.4: для фикса мерцания
+        self.bit_window = None
         self.poll()
+
+    def _setup_alt_tab(self):
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            self.withdraw()
+            self.after(50, self.deiconify)
+            worker_log(f"[alt_tab] applied, hwnd={hwnd}")
+        except Exception as e:
+            worker_log(f"[alt_tab] error: {e}")
 
     def _build_header(self):
         h = ctk.CTkFrame(self.main, fg_color=BG_DARK, height=self.HEADER_H,
@@ -1659,9 +1670,9 @@ class SqueezeWidget(ctk.CTk):
         self.table_frame = ctk.CTkFrame(self.main, fg_color=BG,
                                         corner_radius=0)
         self.table_frame.pack(fill="both", expand=True,
-                              padx=12, pady=(0, 8))
+                              padx=12, pady=(0, 4))
         self.row_widgets = []
-        # v1.3.3: номер версии внизу окна
+
         self.version_lbl = ctk.CTkLabel(
             self.main, text=f"v{WIDGET_VERSION}",
             font=("Segoe UI", 11, "bold"),
@@ -1683,7 +1694,6 @@ class SqueezeWidget(ctk.CTk):
         self.bind("<Button-3>", self._show_menu)
 
     def _open_bit_window(self):
-        # если уже открыто — поднимаем
         if self.bit_window is not None:
             try:
                 if self.bit_window.winfo_exists():
@@ -1693,6 +1703,25 @@ class SqueezeWidget(ctk.CTk):
             except Exception:
                 pass
         self.bit_window = BitHistoryWindow(self)
+
+    def _copy_ticker(self, symbol):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(symbol)
+            worker_log(f"[copy] {symbol}")
+        except Exception as e:
+            worker_log(f"[copy] error: {e}")
+
+    def _calc_render_hash(self):
+        now = time.time()
+        parts = []
+        for sym, st in sorted(squeeze_state.items()):
+            sv = st.get("status", "forming")
+            if sv == "cancelled":
+                continue
+            mins = int((now - st.get("started", now)) / 60)
+            parts.append(f"{sym}:{sv}:{mins}:{st.get('touch_count', 0)}")
+        return hash(tuple(parts))
 
     def _on_press(self, e):
         self._press_x = e.x
@@ -1782,16 +1811,20 @@ class SqueezeWidget(ctk.CTk):
         self.row_widgets.clear()
 
         now = time.time()
-        active, forming, broken_up, broken_down = [], [], [], []
+        active, broken_up, broken_down, long_ranges = [], [], [], []
 
         for sym, st in squeeze_state.items():
-            sv = st.get("status", "forming")
+            sv = st.get("status", "active")
             if sv == "cancelled":
                 continue
+            duration_h = (now - st.get("started", now)) / 3600.0
+            is_long = duration_h >= cfg["long_range_hours"]
+
             if sv == "active":
-                active.append((sym, st))
-            elif sv == "forming":
-                forming.append((sym, st))
+                if is_long:
+                    long_ranges.append((sym, st))
+                else:
+                    active.append((sym, st))
             elif sv == "broken_up":
                 broken_up.append((sym, st))
             elif sv == "broken_down":
@@ -1804,14 +1837,12 @@ class SqueezeWidget(ctk.CTk):
             return (rh / rl - 1) * 100 if rl > 0 else 999
 
         active.sort(key=width_of)
-        forming.sort(key=width_of)
+        long_ranges.sort(key=width_of)
         broken_up.sort(key=lambda x: x[1].get("last_breakout", 0), reverse=True)
         broken_down.sort(key=lambda x: x[1].get("last_breakout", 0),
                          reverse=True)
 
-        forming = forming[:cfg["forming_max_show"]]
-
-        if not (active or forming or broken_up or broken_down):
+        if not (active or broken_up or broken_down or long_ranges):
             lbl = ctk.CTkLabel(self.table_frame,
                                text=cfg["idle_text"],
                                font=("Segoe UI", 12, "italic"),
@@ -1831,14 +1862,6 @@ class SqueezeWidget(ctk.CTk):
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
-        if forming and row_idx < max_rows:
-            self._render_section_title("ФОРМИРУЮТСЯ", SAND)
-            for sym, st in forming:
-                if row_idx >= max_rows:
-                    break
-                self._build_row(sym, st, row_idx)
-                row_idx += 1
-
         if (broken_up or broken_down) and row_idx < max_rows:
             self._render_section_title("ВЫНОСЫ", GREEN)
             combined = broken_up + broken_down
@@ -1850,9 +1873,20 @@ class SqueezeWidget(ctk.CTk):
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
+        if long_ranges and row_idx < max_rows:
+            self._render_section_title("ЗАТЯНУВШИЕСЯ", GREY)
+            for sym, st in long_ranges:
+                if row_idx >= max_rows:
+                    break
+                self._build_row(sym, st, row_idx)
+                row_idx += 1
+
     def _build_row(self, sym, st, idx):
         now = time.time()
-        sv = st.get("status", "forming")
+        sv = st.get("status", "active")
+        duration_h = (now - st.get("started", now)) / 3600.0
+        is_long = duration_h >= cfg["long_range_hours"]
+
         row_bg = BG_ROW_ALT if idx % 2 else BG
 
         row = ctk.CTkFrame(self.table_frame, fg_color=row_bg,
@@ -1860,14 +1894,14 @@ class SqueezeWidget(ctk.CTk):
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
 
-        if sv == "forming":
-            icon_color = SAND
-            icon_char = "○"
-        elif sv == "broken_up":
+        if sv == "broken_up":
             icon_color = GREEN
             icon_char = "●"
         elif sv == "broken_down":
             icon_color = RED
+            icon_char = "●"
+        elif is_long:
+            icon_color = GREY
             icon_char = "●"
         else:
             icon_color = PEACH
@@ -1885,22 +1919,21 @@ class SqueezeWidget(ctk.CTk):
         icon_lbl.pack(side="left")
 
         ticker = sym.replace("USDT", "")
-        if sv == "forming":
-            fg = SAND
-            fnt = ("Segoe UI", 11, "italic")
-        elif sv == "broken_up":
+        if sv == "broken_up":
             fg = GREEN
             fnt = ("Segoe UI", 11, "bold")
         elif sv == "broken_down":
             fg = RED
             fnt = ("Segoe UI", 11, "bold")
+        elif is_long:
+            fg = GREY
+            fnt = ("Segoe UI", 11, "italic")
         else:
             fg = PEACH
             fnt = ("Segoe UI", 11, "bold")
         l = ctk.CTkLabel(row, text=ticker, font=fnt, text_color=fg,
                          width=self.COLUMNS[0][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
-        # v1.3.4: ЛКМ по тикеру — копировать полный символ
         l.bind("<Button-1>", lambda e, s=sym: self._copy_ticker(s))
 
         dur = now - st.get("started", now)
@@ -1955,14 +1988,11 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[5][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
-        # v1.3.3: метка «возможно тренд» для трендовых монет
-        if st.get("is_trending", False):
-            trend_lbl = ctk.CTkLabel(
-                row, text="возможно тренд",
-                font=("Segoe UI", 9, "italic"),
-                text_color=GREY, anchor="w"
-            )
-            trend_lbl.pack(side="left", padx=(8, 0))
+        if is_long:
+            long_lbl = ctk.CTkLabel(row, text="затянувшийся",
+                                    font=("Segoe UI", 9, "italic"),
+                                    text_color=GREY, anchor="w")
+            long_lbl.pack(side="left", padx=(8, 0))
 
         self.row_widgets.append(row)
 
@@ -1987,7 +2017,7 @@ class SqueezeWidget(ctk.CTk):
         elif etype == "breakout":
             side = ev.get("side", "up")
             title = f"{ticker} · вынос {'вверх' if side == 'up' else 'вниз'}"
-            subtitle = "Диапазон пробит"
+            subtitle = "Close за границей"
             color = GREEN if side == "up" else RED
         elif etype == "return":
             title = f"{ticker} · возврат"
@@ -2030,28 +2060,6 @@ class SqueezeWidget(ctk.CTk):
         if popup in self.active_popups:
             self.active_popups.remove(popup)
 
-    def _copy_ticker(self, symbol):
-        """v1.3.4: копирует полный символ в буфер обмена."""
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(symbol)
-            worker_log(f"[copy] {symbol}")
-        except Exception as e:
-            worker_log(f"[copy] error: {e}")
-
-    def _calc_render_hash(self):
-        """v1.3.4: отпечаток текущего состояния для фикса мерцания."""
-        now = time.time()
-        parts = []
-        for sym, st in sorted(squeeze_state.items()):
-            sv = st.get("status", "forming")
-            if sv == "cancelled":
-                continue
-            # время в минутах — чтобы раз в минуту перерисовывать
-            mins_in_range = int((now - st.get("started", now)) / 60)
-            parts.append(f"{sym}:{sv}:{mins_in_range}:{st.get('touch_count', 0)}")
-        return hash(tuple(parts))
-
     def poll(self):
         now = time.time()
         changed = False
@@ -2070,17 +2078,13 @@ class SqueezeWidget(ctk.CTk):
                 self._show_popup(ev)
             changed = True
 
-        # v1.3.4: перерисовка только если состояние изменилось
         new_hash = self._calc_render_hash()
-        need_render = (
-            changed
-            or new_hash != self._last_render_hash
-        )
+        need_render = (changed or new_hash != self._last_render_hash)
         if need_render:
             self._render()
             self._last_render_hash = new_hash
             self.last_draw = now
-        self.after(1000, self.poll)   # раз в секунду проверяем
+        self.after(1000, self.poll)
 
 
 # ============ TEST MODE ============
@@ -2088,15 +2092,15 @@ def inject_test():
     import random
     now = time.time()
     fake = [
-        ("GTCUSDT", 0.85, 0.84, now - 1800, "active"),
-        ("RSRUSDT", 0.125, 0.122, now - 1800, "active"),
-        ("STRKUSDT", 2.45, 2.40, now - 1700, "active"),
-        ("CKBUSDT", 0.0125, 0.0123, now - 1800, "broken_up"),
-        ("WUSDT", 0.95, 0.92, now - 1700, "broken_down"),
-        ("SOPHUSDT", 0.510, 0.505, now - 1500, "forming"),
-        ("UAIUSDT", 0.350, 0.346, now - 900, "forming"),
+        ("GTCUSDT", 0.85, 0.84, now - 1800, "active", False),
+        ("OGNUSDT", 0.125, 0.122, now - 1800, "active", False),
+        ("STRKUSDT", 2.45, 2.40, now - 1700, "active", False),
+        ("CKBUSDT", 0.0125, 0.0123, now - 1800, "broken_up", False),
+        ("WUSDT", 0.95, 0.92, now - 1700, "broken_down", False),
+        ("SAFEUSDT", 0.510, 0.505, now - 60 * 3600, "active", True),
+        ("DUSKUSDT", 0.350, 0.346, now - 900, "active", False),
     ]
-    for sym, rh, rl, started, stat in fake:
+    for sym, rh, rl, started, stat, is_long in fake:
         squeeze_state[sym] = {
             "status": stat,
             "range_high": rh,
@@ -2109,20 +2113,12 @@ def inject_test():
                              ("down" if stat == "broken_down" else None),
             "touch_count": random.randint(1, 4),
             "breakout_count": 0,
+            "exit_candles": 1 if stat.startswith("broken") else 0,
             "growth_24h": 45.0,
-            "pullback": 22.0,
-            "high_24h": rh * 1.3,
-            "low_after_high": rl,
             "volume_24h": 25_000_000,
+            "high_24h": rh * 1.3,
             "last_update_ts": now,
         }
-    # тестовая запись в БИТ
-    add_bit_history("TESTUSDT", {
-        "range_high": 0.85, "range_low": 0.84,
-        "started": now - 1800,
-        "growth_24h": 45.0, "pullback": 22.0,
-        "volume_24h": 25_000_000,
-    }, 0.86)
     status["warmup_finished"] = True
     status["text"] = "онлайн (тест)"
 
@@ -2133,7 +2129,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.3.4 ===")
+    worker_log(f"=== start v{WIDGET_VERSION} ===")
 
     if "--test" in sys.argv:
         inject_test()
