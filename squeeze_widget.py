@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.0 — чистая архитектура: активные диапазоны + история БИТ
+Версия 2.0.1 — фикс Механизма 2, скролл главного списка
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -10,6 +10,8 @@ Changelog:
         Механизм 2: история БИТ (паттерн-матчинг 24ч)
         Оба механизма независимы
         Убраны find_active_range, t_high, is_trend
+    2.0.1 — фикс Механизма 2: range_high фиксируется на момент начала
+            скролл главного списка
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -46,7 +48,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.0"
+WIDGET_VERSION = "2.0.1"
 
 
 # ============ ЦВЕТА ============
@@ -875,8 +877,11 @@ def find_bit_patterns(sym, candles_5m, candles_1h):
     if len(subset) < cfg["bit_pattern_range_min_candles"]:
         return patterns
 
-    rh = max(c["high"] for c in subset)
-    rl = min(c["low"] for c in subset)
+    # v2.0.1: range_high ФИКСИРУЕТСЯ на первые N свечей диапазона
+    N = cfg["bit_pattern_range_min_candles"]
+    first_n = subset[:N]
+    rh = max(c["high"] for c in first_n)
+    rl = min(c["low"] for c in first_n)
     if rl <= 0:
         return patterns
     width = (rh / rl - 1) * 100
@@ -887,13 +892,13 @@ def find_bit_patterns(sym, candles_5m, candles_1h):
     if width > g1h["growth_24h"] * cfg["range_width_k1"]:
         return patterns
 
-    # ищем выход вверх в subset
+    # ищем выход вверх в subset ПОСЛЕ первых N свечей
     exit_candles = cfg["bit_pattern_exit_candles"]
     consecutive_outside = 0
     fired_ts = None
     exit_price = None
 
-    for c in subset:
+    for c in subset[N:]:
         if c["close"] > rh:
             consecutive_outside += 1
             if consecutive_outside >= exit_candles:
@@ -1507,7 +1512,7 @@ class SqueezeWidget(ctk.CTk):
     COL_HEADER_H = 26
     ROW_H = 32
     SECTION_H = 20
-    TABLE_H = ROW_H * 10 + SECTION_H * 4
+    TABLE_H = ROW_H * 12 + SECTION_H * 4
     IDLE_H = 60
 
     COLUMNS = [
@@ -1667,8 +1672,12 @@ class SqueezeWidget(ctk.CTk):
             lbl.pack(side="left", padx=(self.COL_PAD, 0))
 
     def _build_table(self):
-        self.table_frame = ctk.CTkFrame(self.main, fg_color=BG,
-                                        corner_radius=0)
+        # v2.0.1: скролл через CTkScrollableFrame
+        self.table_frame = ctk.CTkScrollableFrame(
+            self.main, fg_color=BG, corner_radius=0,
+            scrollbar_button_color=ACCENT,
+            scrollbar_button_hover_color=ACCENT_HOVER,
+        )
         self.table_frame.pack(fill="both", expand=True,
                               padx=12, pady=(0, 4))
         self.row_widgets = []
@@ -1851,33 +1860,27 @@ class SqueezeWidget(ctk.CTk):
             self.row_widgets.append(lbl)
             return
 
-        max_rows = cfg["max_rows_visible"]
+        # v2.0.1: без лимита — скролл позволяет видеть всё
         row_idx = 0
 
         if active:
             self._render_section_title("АКТИВНЫЕ", PEACH)
-            for sym, st in active[:max_rows]:
-                if row_idx >= max_rows:
-                    break
+            for sym, st in active:
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
-        if (broken_up or broken_down) and row_idx < max_rows:
+        if (broken_up or broken_down):
             self._render_section_title("ВЫНОСЫ", GREEN)
             combined = broken_up + broken_down
             combined.sort(key=lambda x: x[1].get("last_breakout", 0),
                           reverse=True)
             for sym, st in combined:
-                if row_idx >= max_rows:
-                    break
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
-        if long_ranges and row_idx < max_rows:
+        if long_ranges:
             self._render_section_title("ЗАТЯНУВШИЕСЯ", GREY)
             for sym, st in long_ranges:
-                if row_idx >= max_rows:
-                    break
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
