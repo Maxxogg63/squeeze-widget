@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.4.1 — дедупликация БИТ, колонка диапазона в окне БИТ
+Версия 1.4.2 — дедупликация по exit_ts, только последний выход
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -23,6 +23,9 @@ Changelog:
             записи БИТ при прогреве, много выходов из одного диапазона
     1.4.1 — дедупликация БИТ в истории (по symbol + fired_at)
             в окне БИТ добавлена колонка ДИАПАЗОН (low — high)
+    1.4.2 — дедупликация по (symbol, exit_ts)
+            find_active_range возвращает ТОЛЬКО последний выход
+            при прогреве записывается 1 запись на монету
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -62,7 +65,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
 
 # версия виджета — отображается внизу окна
-WIDGET_VERSION = "1.4.1"
+WIDGET_VERSION = "1.4.2"
 
 
 # ============ ЦВЕТА ============
@@ -386,7 +389,8 @@ def log_squeeze(sym, state):
 # ============ ИСТОРИЯ БИТ ============
 def _bit_history_header():
     return [
-        "symbol", "detected_at", "fired_at", "duration_in_range_sec",
+        "symbol", "detected_at", "fired_at", "exit_ts",
+        "duration_in_range_sec",
         "range_high", "range_low", "width_pct",
         "growth_24h", "pullback", "volume_24h",
         "exit_price",
@@ -445,16 +449,19 @@ def load_bit_history():
         worker_log(f"load_bit_history error: {e}")
 
 
-def add_bit_history(sym, state, exit_price):
+def add_bit_history(sym, state, exit_price, exit_ts=None):
     """Добавляет новую запись в историю БИТ."""
     now = time.time()
+    if exit_ts is None:
+        exit_ts = now
     fired_at_str = _ts(now)
-    # v1.4.1: дедупликация — если (symbol, fired_at) уже есть, не добавляем
+    # v1.4.2: дедупликация по (symbol, exit_ts с точностью до минуты)
+    exit_key = int(exit_ts // 60)
     with bit_history_lock:
         for existing in bit_history:
-            if existing.get("symbol") == sym and \
-               existing.get("fired_at") == fired_at_str:
-                worker_log(f"[v1.4.1] dedup skipped {sym} {fired_at_str}")
+            ex_key = int(float(existing.get("exit_ts", 0)) // 60)
+            if existing.get("symbol") == sym and ex_key == exit_key:
+                worker_log(f"[v1.4.2] dedup {sym} exit_key={exit_key}")
                 return None
     width = (state["range_high"] / state["range_low"] - 1) * 100 \
         if state["range_low"] > 0 else 0
@@ -462,6 +469,7 @@ def add_bit_history(sym, state, exit_price):
         "symbol": sym,
         "detected_at": _ts(state.get("started", now)),
         "fired_at": fired_at_str,
+        "exit_ts": exit_ts,
         "duration_in_range_sec": int(now - state.get("started", now)),
         "range_high": state["range_high"],
         "range_low": state["range_low"],
@@ -740,21 +748,22 @@ def find_active_range(candles_5m, t_high_ts):
             # этот диапазон активен (нет выхода)
             last_active_start = orig_i
         else:
-            # был выход — записываем в историю если вверх
+            # был выход — v1.4.2: запоминаем ТОЛЬКО последний
             if has_breakout_up:
-                # найдём цену выхода
                 exit_price = None
+                exit_ts_val = None
                 for c in subset[cfg["range_forming_min_candles"]:]:
                     if c["high"] > rh_initial * (1 + breakout_threshold):
                         exit_price = c["high"]
+                        exit_ts_val = c["t"] / 1000.0
                         break
-                exits.append({
+                exits = [{
                     "start_idx": orig_i,
                     "rh": rh_initial,
                     "rl": rl_initial,
                     "exit_price": exit_price,
-                    "exit_ts": c["t"] / 1000.0,
-                })
+                    "exit_ts": exit_ts_val,
+                }]
     
     return last_active_start, exits
 
@@ -790,7 +799,7 @@ def build_state(sym, candles_5m, candles_1h):
     # v1.4.0: ищем ПОСЛЕДНИЙ АКТИВНЫЙ диапазон
     active_start, past_exits = find_active_range(candles_5m, g1h["t_high"])
 
-    # записываем прошлые БИТ в историю
+    # записываем прошлый БИТ в историю (только последний — v1.4.2)
     for ex in past_exits:
         try:
             fake_state = {
@@ -803,9 +812,10 @@ def build_state(sym, candles_5m, candles_1h):
                 "volume_24h": volume,
                 "candles_in_range": 0,
             }
-            add_bit_history(sym, fake_state, ex["exit_price"])
+            add_bit_history(sym, fake_state, ex["exit_price"],
+                            exit_ts=ex.get("exit_ts"))
         except Exception as e:
-            worker_log(f"[v1.4.0] bit_history error {sym}: {e}")
+            worker_log(f"[v1.4.2] bit_history error {sym}: {e}")
 
     if active_start is None:
         # нет активного диапазона
@@ -947,7 +957,7 @@ def update_state(sym, state, k):
                 state["left_reason"] = sv
                 if sv == "broken_up":
                     # БИТ СРАБОТАЛ
-                    add_bit_history(sym, state, close)
+                    add_bit_history(sym, state, close, exit_ts=now)
                     return {"type": "bit_signal", "symbol": sym,
                             "state": state}
                 else:
@@ -2272,7 +2282,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.4.1 ===")
+    worker_log("=== start v1.4.2 ===")
 
     if "--test" in sys.argv:
         inject_test()
