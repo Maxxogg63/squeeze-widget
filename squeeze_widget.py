@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 1.3.3 — метка «возможно тренд», версия в UI
+Версия 1.3.4 — крупная версия, фикс мерцания, копирование тикера
 
 Changelog:
     1.3.0 — pullback на 5m, фикс последнего хая, k1=0.5
@@ -14,6 +14,9 @@ Changelog:
     1.3.3 — is_trend больше не отсеивает, а помечает монету
             метка «возможно тренд» в UI
             номер версии внизу окна
+    1.3.4 — версия крупнее и золотая
+            фикс мерцания (хэш-сравнение, перерисовка раз в минуту)
+            ЛКМ по тикеру копирует полный символ (GTCUSDT) в буфер
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -53,7 +56,7 @@ SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT")
 
 # версия виджета — отображается внизу окна
-WIDGET_VERSION = "1.3.3"
+WIDGET_VERSION = "1.3.4"
 
 
 # ============ ЦВЕТА ============
@@ -1569,6 +1572,7 @@ class SqueezeWidget(ctk.CTk):
 
         self.active_popups = []
         self.bit_window = None   # ссылка на окно БИТ
+        self._last_render_hash = None   # v1.3.4: для фикса мерцания
         self.poll()
 
     def _build_header(self):
@@ -1660,8 +1664,8 @@ class SqueezeWidget(ctk.CTk):
         # v1.3.3: номер версии внизу окна
         self.version_lbl = ctk.CTkLabel(
             self.main, text=f"v{WIDGET_VERSION}",
-            font=("Segoe UI", 8),
-            text_color=GREY, anchor="e"
+            font=("Segoe UI", 11, "bold"),
+            text_color=GOLD, anchor="e"
         )
         self.version_lbl.pack(fill="x", padx=14, pady=(0, 4))
 
@@ -1896,6 +1900,8 @@ class SqueezeWidget(ctk.CTk):
         l = ctk.CTkLabel(row, text=ticker, font=fnt, text_color=fg,
                          width=self.COLUMNS[0][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
+        # v1.3.4: ЛКМ по тикеру — копировать полный символ
+        l.bind("<Button-1>", lambda e, s=sym: self._copy_ticker(s))
 
         dur = now - st.get("started", now)
         l = ctk.CTkLabel(row, text=fmt_duration(dur),
@@ -2024,6 +2030,28 @@ class SqueezeWidget(ctk.CTk):
         if popup in self.active_popups:
             self.active_popups.remove(popup)
 
+    def _copy_ticker(self, symbol):
+        """v1.3.4: копирует полный символ в буфер обмена."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(symbol)
+            worker_log(f"[copy] {symbol}")
+        except Exception as e:
+            worker_log(f"[copy] error: {e}")
+
+    def _calc_render_hash(self):
+        """v1.3.4: отпечаток текущего состояния для фикса мерцания."""
+        now = time.time()
+        parts = []
+        for sym, st in sorted(squeeze_state.items()):
+            sv = st.get("status", "forming")
+            if sv == "cancelled":
+                continue
+            # время в минутах — чтобы раз в минуту перерисовывать
+            mins_in_range = int((now - st.get("started", now)) / 60)
+            parts.append(f"{sym}:{sv}:{mins_in_range}:{st.get('touch_count', 0)}")
+        return hash(tuple(parts))
+
     def poll(self):
         now = time.time()
         changed = False
@@ -2042,10 +2070,17 @@ class SqueezeWidget(ctk.CTk):
                 self._show_popup(ev)
             changed = True
 
-        if changed or now - self.last_draw > 0.5:
+        # v1.3.4: перерисовка только если состояние изменилось
+        new_hash = self._calc_render_hash()
+        need_render = (
+            changed
+            or new_hash != self._last_render_hash
+        )
+        if need_render:
             self._render()
+            self._last_render_hash = new_hash
             self.last_draw = now
-        self.after(30, self.poll)
+        self.after(1000, self.poll)   # раз в секунду проверяем
 
 
 # ============ TEST MODE ============
@@ -2098,7 +2133,7 @@ if __name__ == "__main__":
     load_cache()
     load_bit_history()
     save_last_seen()
-    worker_log("=== start v1.3.3 ===")
+    worker_log("=== start v1.3.4 ===")
 
     if "--test" in sys.argv:
         inject_test()
