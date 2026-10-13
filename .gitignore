@@ -1,0 +1,22 @@
+# Рабочие файлы — не пушим в GitHub
+last_seen_squeeze.txt
+squeeze_cache.json
+squeeze_log.csv
+squeeze_bit_signals.csv
+squeeze_bit_history.csv
+squeeze_expired.csv
+squeeze_worker.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Системные
+Thumbs.db
+.DS_Store
