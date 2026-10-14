@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.3.0 — график БИТ в Истории
+Версия 2.3.1 — фикс update_active_state (вынос/уход)
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.3.0"
+WIDGET_VERSION = "2.3.1"
 
 
 # ============ ЦВЕТА ============
@@ -874,8 +874,12 @@ def build_active_state(sym, candles_5m, candles_1h):
 
 def update_active_state(sym, state, k):
     """
-    Обновляет состояние активного диапазона.
-    Возвращает event-dict или None.
+    v2.3.1: обновляет состояние активного диапазона.
+    Правильная логика:
+      - active/forming: если close вышел → вынос (один раз)
+      - broken_up/broken_down: если close вернулся → возврат
+                                если всё ещё вне → +1 к exit_candles
+                                >= 6 → уход (bit_signal или cancelled)
     """
     now = time.time()
     close = k["close"]
@@ -898,47 +902,60 @@ def update_active_state(sym, state, k):
         state["last_touch"] = now
         state["touch_count"] += 1
 
-    # вынос по close
     broke_up = close > state["range_high"]
     broke_down = close < state["range_low"]
 
-    if broke_up or broke_down:
-        side = "up" if broke_up else "down"
-        state["last_breakout"] = now
-        state["breakout_side"] = side
-        state["breakout_count"] += 1
-        state["status"] = "broken_up" if broke_up else "broken_down"
-        state["exit_candles"] = 1
-        return {"type": "breakout", "symbol": sym,
-                "side": side, "state": state}
+    # --- СЛУЧАЙ 1: монета внутри диапазона (active/forming) ---
+    if sv in ("active", "forming"):
+        if broke_up or broke_down:
+            side = "up" if broke_up else "down"
+            state["status"] = "broken_up" if broke_up else "broken_down"
+            state["breakout_side"] = side
+            state["breakout_count"] += 1
+            state["exit_candles"] = 1
+            state["last_breakout"] = now
+            return {"type": "breakout", "symbol": sym,
+                    "side": side, "state": state}
+        return None
 
-    # если в статусе broken — считаем свечи вне
+    # --- СЛУЧАЙ 2: монета вне диапазона (broken_up/broken_down) ---
     if sv in ("broken_up", "broken_down"):
-        # проверка возврата
+        # вернулась?
         if state["range_low"] <= close <= state["range_high"]:
             state["status"] = "active"
             state["exit_candles"] = 0
             return {"type": "return", "symbol": sym, "state": state}
-        else:
-            state["exit_candles"] += 1
-            if state["exit_candles"] >= cfg["breakout_exit_candles"]:
-                # уход
-                state["status"] = "cancelled"
-                state["left_at"] = now
-                state["left_reason"] = sv
-                if sv == "broken_up":
-                    # БИТ сработал
-                    add_bit_history(sym, state, close, fired_ts=now)
-                    return {"type": "bit_signal", "symbol": sym,
-                            "state": state}
-                else:
-                    backstage[sym] = {
-                        "state": state,
-                        "left_at": now,
-                        "left_reason": sv,
-                    }
-                    return {"type": "cancelled", "symbol": sym,
-                            "state": state}
+
+        # всё ещё вне
+        state["exit_candles"] += 1
+        if state["exit_candles"] >= cfg["breakout_exit_candles"]:
+            state["status"] = "cancelled"
+            state["left_at"] = now
+            state["left_reason"] = sv
+
+            if sv == "broken_up":
+                add_bit_history(sym, state, close, fired_ts=now)
+                # v2.3.1: удаляем из squeeze_state (для работы заднего двора)
+                try:
+                    del squeeze_state[sym]
+                except Exception:
+                    pass
+                return {"type": "bit_signal", "symbol": sym,
+                        "state": state}
+            else:
+                backstage[sym] = {
+                    "state": state,
+                    "left_at": now,
+                    "left_reason": sv,
+                }
+                # v2.3.1: удаляем из squeeze_state
+                try:
+                    del squeeze_state[sym]
+                except Exception:
+                    pass
+                return {"type": "cancelled", "symbol": sym,
+                        "state": state}
+        return None
 
     return None
 
