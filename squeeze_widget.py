@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.3.1 — фикс update_active_state (вынос/уход)
+Версия 2.3.3 — рост/падение, раздел АКТИВНЫЕ
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.3.1"
+WIDGET_VERSION = "2.3.3"
 
 
 # ============ ЦВЕТА ============
@@ -685,29 +685,58 @@ def update_bit_history_stats():
 
 
 # ============ ДЕТЕКТОР ============
-def calc_growth_1h(candles_1h):
-    """Рост за 24ч по 1H."""
-    if not candles_1h or len(candles_1h) < 4:
+def calc_growth_5m(candles_5m):
+    """
+    v2.3.3: рост и падение с учётом порядка.
+      growth_24h = max(high[j]/low[i] - 1), i < j  (лой раньше хая)
+      drop_24h   = max(1 - low[j]/high[i]), i < j  (хай раньше лоя)
+    O(N) — один проход.
+    """
+    if not candles_5m or len(candles_5m) < 4:
         return None
-    highs = [c["high"] for c in candles_1h]
-    lows = [c["low"] for c in candles_1h]
-    max_high = max(highs)
-    min_low = min(lows)
-    if min_low <= 0:
-        return None
-    growth = (max_high / min_low - 1) * 100
-    # последний индекс хая
-    idx_high = len(highs) - 1 - highs[::-1].index(max_high)
-    # v2.0.3: изменение цены за 24ч (для показа)
-    close_24h_ago = candles_1h[0]["close"]
-    close_now = candles_1h[-1]["close"]
+    lst = list(candles_5m)
+
+    # --- РОСТ: max(high[j]/low[i] - 1), i < j ---
+    max_growth = 0.0
+    min_low_so_far = lst[0]["low"]
+    idx_high_for_growth = 0
+    for i, c in enumerate(lst):
+        if min_low_so_far > 0:
+            g = c["high"] / min_low_so_far - 1
+            if g > max_growth:
+                max_growth = g
+                idx_high_for_growth = i
+        if c["low"] < min_low_so_far:
+            min_low_so_far = c["low"]
+
+    # --- ПАДЕНИЕ: max(1 - low[j]/high[i]), i < j ---
+    max_drop = 0.0
+    max_high_so_far = lst[0]["high"]
+    idx_low_for_drop = 0
+    for i, c in enumerate(lst):
+        if max_high_so_far > 0:
+            d = 1 - c["low"] / max_high_so_far
+            if d > max_drop:
+                max_drop = d
+                idx_low_for_drop = i
+        if c["high"] > max_high_so_far:
+            max_high_so_far = c["high"]
+
+    # change_24h — стандартное изменение
+    close_24h_ago = lst[0]["close"]
+    close_now = lst[-1]["close"]
     change_24h = (close_now / close_24h_ago - 1) * 100 \
         if close_24h_ago > 0 else 0.0
+
+    # t_high_ts — время хая для роста
+    t_high_ts = lst[idx_high_for_growth]["t"] / 1000.0
+
     return {
-        "growth_24h": growth,
-        "change_24h": change_24h,   # новое
-        "high_24h": max_high,
-        "t_high_ts": candles_1h[idx_high]["t"] / 1000.0,
+        "growth_24h": max_growth * 100,
+        "drop_24h": max_drop * 100,
+        "change_24h": change_24h,
+        "high_24h": max_high_so_far,
+        "t_high_ts": t_high_ts,
     }
 
 
@@ -722,8 +751,9 @@ def calc_volume_24h_usdt(candles_5m):
     return total
 
 
-def is_fresh(growth, volume):
-    if growth < cfg["growth_24h_min_pct"]:
+def is_fresh(growth, volume, drop=0.0):
+    """v2.3.3: фильтр по max(growth, drop)."""
+    if max(growth, drop) < cfg["growth_24h_min_pct"]:
         status["fail_growth"] += 1
         return False, "growth"
     if volume and volume < cfg["volume_24h_min_usdt"]:
@@ -785,12 +815,14 @@ def build_active_state(sym, candles_5m, candles_1h):
     """Строит активный диапазон. Возвращает state или None."""
     status["stats_buf"] += 1
 
-    g1h = calc_growth_1h(candles_1h)
+    # v2.3.2: growth из 5m (свежий, не устаревает)
+    g1h = calc_growth_5m(candles_5m)
     if not g1h:
         return None
 
     volume = calc_volume_24h_usdt(candles_5m)
-    ok, fail_reason = is_fresh(g1h["growth_24h"], volume)
+    ok, fail_reason = is_fresh(g1h["growth_24h"], volume,
+                                drop=g1h.get("drop_24h", 0.0))
     if not ok:
         if sym in DEBUG_SYMBOLS:
             worker_log(
@@ -803,12 +835,9 @@ def build_active_state(sym, candles_5m, candles_1h):
     # ищем начало диапазона
     start_idx = find_range_start(candles_5m, g1h["t_high_ts"])
 
+    # v2.3.3: убран fallback — если диапазон не найден, монета не проходит
     if start_idx is None:
-        # fallback — последние N свечей
-        n = cfg["range_forming_min_candles"]
-        if len(candles_5m) < n:
-            return None
-        start_idx = len(candles_5m) - n
+        return None
 
     subset = list(candles_5m)[start_idx:]
     if len(subset) < cfg["range_forming_min_candles"]:
@@ -852,6 +881,7 @@ def build_active_state(sym, candles_5m, candles_1h):
         "breakout_count": 0,
         "exit_candles": 0,        # счётчик close вне
         "growth_24h": g1h["growth_24h"],
+        "drop_24h": g1h.get("drop_24h", 0.0),
         "change_24h": g1h.get("change_24h", 0.0),
         "volume_24h": volume,
         "high_24h": g1h["high_24h"],
@@ -1046,10 +1076,12 @@ def find_bit_patterns(sym, candles_5m, candles_1h):
     if len(candles_5m) < 50:
         return patterns
 
-    g1h = calc_growth_1h(candles_1h)
+    # v2.3.2: growth из 5m
+    g1h = calc_growth_5m(candles_5m)
     if not g1h:
         return patterns
-    if g1h["growth_24h"] < cfg["bit_pattern_growth_min_pct"]:
+    if max(g1h["growth_24h"], g1h.get("drop_24h", 0)) \
+            < cfg["bit_pattern_growth_min_pct"]:
         return patterns
 
     volume = calc_volume_24h_usdt(candles_5m)
@@ -2585,9 +2617,26 @@ class SqueezeWidget(ctk.CTk):
         # v2.0.1: без лимита — скролл позволяет видеть всё
         row_idx = 0
 
-        if active:
-            self._render_section_title("АКТИВНЫЕ", PEACH)
-            for sym, st in active:
+        # v2.3.3: разделяем активные на РОСТ и ПАДЕНИЕ
+        active_up = []
+        active_down = []
+        for sym, st in active:
+            growth = st.get("growth_24h", 0)
+            drop = st.get("drop_24h", 0)
+            if growth >= drop:
+                active_up.append((sym, st))
+            else:
+                active_down.append((sym, st))
+
+        if active_up:
+            self._render_section_title("АКТИВНЫЕ (РОСТ)", GREEN)
+            for sym, st in active_up:
+                self._build_row(sym, st, row_idx)
+                row_idx += 1
+
+        if active_down:
+            self._render_section_title("АКТИВНЫЕ (ПАДЕНИЕ)", RED)
+            for sym, st in active_down:
                 self._build_row(sym, st, row_idx)
                 row_idx += 1
 
@@ -2685,13 +2734,18 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[1][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
 
-        # v2.0.3: ИЗМ 24ч (изменение цены за 24ч)
-        change = st.get("change_24h", 0)
-        if change >= 0:
+        # v2.3.3: ИЗМ 24ч — показываем рост (+) или падение (−)
+        growth_v = st.get("growth_24h", 0)
+        drop_v = st.get("drop_24h", 0)
+        if growth_v >= drop_v:
+            # показываем рост
+            ch_text = f"+{growth_v:.1f}%"
             ch_color = GREEN
         else:
+            # показываем падение
+            ch_text = f"-{drop_v:.1f}%"
             ch_color = RED
-        l = ctk.CTkLabel(row, text=f"{change:+.1f}%",
+        l = ctk.CTkLabel(row, text=ch_text,
                          font=("Segoe UI", 11, "bold"), text_color=ch_color,
                          width=self.COLUMNS[2][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))

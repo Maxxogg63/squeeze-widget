@@ -20,3 +20,13 @@ __pycache__/
 # Системные
 Thumbs.db
 .DS_Store
+
+# временные скрипты
+apply_v*.py
+check_*.py
+
+# бэкапы
+*.bak
+
+# временные папки
+examples/
