@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.0.5 — фикс watchlist (io.open → open)
+Версия 2.1.0 — личное Избранное (Watchlist)
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -20,6 +20,8 @@ Changelog:
             окно расширено до 620px
     2.0.4 — кнопка 📤 Watchlist (выгрузка активных в .txt для TradingView)
     2.0.5 — фикс: io.open → open (io не импортирован)
+    2.1.0 — личное Избранное: иконка ☆ в строках, окно "Избранное"
+            файл squeeze_watchlist.csv, сортировка по дате
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -53,10 +55,11 @@ EXPIRED_LOG_PATH = os.path.join(BASE_DIR, "squeeze_expired.csv")
 WORKER_LOG_PATH = os.path.join(BASE_DIR, "squeeze_worker.log")
 LAST_SEEN_PATH = os.path.join(BASE_DIR, "last_seen_squeeze.txt")
 SOUND_PATH = os.path.join(ASSETS_DIR, "squeeze_alert.wav")
+WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.0.5"
+WIDGET_VERSION = "2.1.0"
 
 
 # ============ ЦВЕТА ============
@@ -177,6 +180,10 @@ bit_history_lock = threading.Lock()
 # v2.0.2: лента событий
 event_log: "collections.deque" = deque(maxlen=200)
 event_log_lock = threading.Lock()
+
+# v2.1.0: личное Избранное
+watchlist: dict = {}
+watchlist_lock = threading.Lock()
 
 cfg = dict(DEFAULTS)
 
@@ -343,6 +350,93 @@ def log_squeeze(sym, state):
                 f"{state.get('volume_24h', 0):.0f}")) + "\n")
     except Exception as e:
         print("log_squeeze error:", e)
+
+
+# ============ ЛИЧНОЕ ИЗБРАННОЕ (v2.1.0) ============
+def save_watchlist():
+    try:
+        with open(WATCHLIST_PATH, "w", encoding="utf-8",
+                  newline="") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["symbol", "added_at", "added_ts",
+                        "price_at_add", "range_low", "range_high",
+                        "width_pct"])
+            with watchlist_lock:
+                for sym, info in watchlist.items():
+                    w.writerow([
+                        sym,
+                        info.get("added_at", ""),
+                        info.get("added_ts", 0),
+                        info.get("price_at_add", 0),
+                        info.get("range_low", 0),
+                        info.get("range_high", 0),
+                        info.get("width_pct", 0),
+                    ])
+    except Exception as e:
+        worker_log(f"save_watchlist error: {e}")
+
+
+def load_watchlist():
+    global watchlist
+    if not os.path.exists(WATCHLIST_PATH):
+        return
+    try:
+        with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f, delimiter=";")
+            rows = {}
+            for row in r:
+                sym = row.get("symbol")
+                if not sym:
+                    continue
+                try:
+                    rows[sym] = {
+                        "added_at": row.get("added_at", ""),
+                        "added_ts": float(row.get("added_ts", 0)),
+                        "price_at_add": float(row.get("price_at_add", 0)),
+                        "range_low": float(row.get("range_low", 0)),
+                        "range_high": float(row.get("range_high", 0)),
+                        "width_pct": float(row.get("width_pct", 0)),
+                    }
+                except Exception:
+                    continue
+            with watchlist_lock:
+                watchlist = rows
+        worker_log(f"watchlist loaded: {len(watchlist)} symbols")
+    except Exception as e:
+        worker_log(f"load_watchlist error: {e}")
+
+
+def is_in_watchlist(sym):
+    with watchlist_lock:
+        return sym in watchlist
+
+
+def toggle_watchlist(sym):
+    """Добавить/убрать монету из Избранного."""
+    with watchlist_lock:
+        if sym in watchlist:
+            del watchlist[sym]
+            action = "removed"
+        else:
+            # достаём данные
+            buf = buf_5m.get(sym)
+            price_now = buf[-1]["close"] if buf else 0.0
+            st = squeeze_state.get(sym, {})
+            watchlist[sym] = {
+                "added_at": _ts(time.time()),
+                "added_ts": time.time(),
+                "price_at_add": price_now,
+                "range_low": st.get("range_low", 0),
+                "range_high": st.get("range_high", 0),
+                "width_pct": (
+                    (st.get("range_high", 0) / st.get("range_low", 1) - 1) * 100
+                    if st.get("range_low", 0) > 0 else 0
+                ),
+            }
+            action = "added"
+    save_watchlist()
+    worker_log(f"[watchlist] {action} {sym}")
+    return action
 
 
 def add_event(etype, sym, state, extra=""):
@@ -1704,6 +1798,174 @@ class EventLogWindow(ctk.CTkToplevel):
         self.after(5000, self._auto_refresh)
 
 
+# ============ ОКНО ИЗБРАННОГО ============
+class FavoritesWindow(ctk.CTkToplevel):
+    WIDTH = 950
+    HEIGHT = 500
+
+    COLUMNS = [
+        ("ТИКЕР",      90),
+        ("ДОБАВЛЕН",   130),
+        ("ЦЕНА ДОБ",   100),
+        ("ЦЕНА СЕЙЧ",  100),
+        ("ИЗМ",        80),
+        ("МАКС",       90),
+        ("СТАТУС",     140),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.overrideredirect(False)
+        self.title("⭐ Избранное")
+        self.configure(fg_color=BG)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self.resizable(True, True)
+        px = parent.winfo_x()
+        py = parent.winfo_y()
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{px + 60}+{py + 60}")
+        self._build()
+        self.refresh()
+        self._auto_refresh()
+
+    def _build(self):
+        head = ctk.CTkFrame(self, fg_color=BG_DARK, height=48,
+                            corner_radius=0)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+
+        title = ctk.CTkLabel(head, text="⭐ Избранное",
+                             font=("Segoe UI", 16, "bold"),
+                             text_color=GOLD)
+        title.pack(side="left", padx=16)
+
+        self.count_label = ctk.CTkLabel(head, text="",
+                                        font=("Segoe UI", 11),
+                                        text_color=SAND)
+        self.count_label.pack(side="left", padx=8)
+
+        btn_close = ctk.CTkButton(head, text="✕", width=32, height=28,
+                                  font=("Segoe UI", 12, "bold"),
+                                  fg_color=ACCENT, hover_color="#8B2E2E",
+                                  text_color=BG_DARK,
+                                  command=self.destroy)
+        btn_close.pack(side="right", padx=8)
+
+        btn_refresh = ctk.CTkButton(head, text="Обновить", width=90,
+                                    height=28,
+                                    font=("Segoe UI", 11),
+                                    fg_color=ACCENT,
+                                    hover_color=ACCENT_HOVER,
+                                    text_color=BG_DARK,
+                                    command=self.refresh)
+        btn_refresh.pack(side="right", padx=4)
+
+        colhead = ctk.CTkFrame(self, fg_color=BG_DARK, height=28,
+                               corner_radius=0)
+        colhead.pack(fill="x", padx=8, pady=(4, 0))
+        colhead.pack_propagate(False)
+        for name, w in self.COLUMNS:
+            lbl = ctk.CTkLabel(colhead, text=name,
+                               font=("Segoe UI", 10, "bold"),
+                               text_color=SAND, width=w, anchor="w")
+            lbl.pack(side="left", padx=(4, 0))
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self, fg_color=BG,
+                                                    corner_radius=0)
+        self.scroll_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def refresh(self):
+        for w in self.scroll_frame.winfo_children():
+            w.destroy()
+        with watchlist_lock:
+            rows = list(watchlist.items())
+        # сортировка по added_ts (свежие сверху)
+        rows.sort(key=lambda x: x[1].get("added_ts", 0), reverse=True)
+        self.count_label.configure(text=f"всего: {len(rows)}")
+        if not rows:
+            lbl = ctk.CTkLabel(self.scroll_frame,
+                               text="Пока пусто. Нажми ☆ в строке активной монеты.",
+                               font=("Segoe UI", 12, "italic"),
+                               text_color=GREY)
+            lbl.pack(pady=40)
+            return
+        for i, (sym, info) in enumerate(rows):
+            self._build_row(sym, info, i)
+
+    def _build_row(self, sym, info, idx):
+        bg = BG_ROW_ALT if idx % 2 else BG
+        row_frame = ctk.CTkFrame(self.scroll_frame, fg_color=bg,
+                                  height=30, corner_radius=4)
+        row_frame.pack(fill="x", pady=1)
+        row_frame.pack_propagate(False)
+
+        ticker = sym.replace("USDT", "")
+        added_at = info.get("added_at", "")[:16]
+        price_at_add = info.get("price_at_add", 0)
+
+        # текущая цена
+        buf = buf_5m.get(sym)
+        price_now = buf[-1]["close"] if buf else 0
+        change = ((price_now / price_at_add - 1) * 100
+                  if price_at_add > 0 else 0)
+
+        # макс после added_ts
+        max_price = 0
+        added_ts = info.get("added_ts", 0)
+        if buf:
+            highs = [c["high"] for c in buf
+                     if c["t"] / 1000.0 >= added_ts]
+            if highs:
+                max_price = max(highs)
+        max_pct = ((max_price / price_at_add - 1) * 100
+                   if price_at_add > 0 else 0)
+
+        # статус
+        st = squeeze_state.get(sym)
+        if st:
+            sv = st.get("status", "active")
+            if sv == "active":
+                status = "в диапазоне"
+                status_color = PEACH
+            elif sv == "broken_up":
+                status = "вынос ↑"
+                status_color = GREEN
+            elif sv == "broken_down":
+                status = "вынос ↓"
+                status_color = RED
+            else:
+                status = sv
+                status_color = GREY
+        else:
+            # нет в squeeze_state — ушла
+            status = "вне диапазона"
+            status_color = GREY
+
+        ch_color = GREEN if change >= 0 else RED
+        mx_color = GREEN if max_pct >= 0 else RED
+
+        values = [
+            (ticker, GOLD, "bold"),
+            (added_at, MINT, "normal"),
+            (f"{price_at_add:.6f}", MINT, "normal"),
+            (f"{price_now:.6f}", MINT, "normal"),
+            (f"{change:+.2f}%", ch_color, "bold"),
+            (f"{max_pct:+.2f}%", mx_color, "bold"),
+            (status, status_color, "bold"),
+        ]
+        for (name, w), (val, c, weight) in zip(self.COLUMNS, values):
+            lbl = ctk.CTkLabel(row_frame, text=str(val),
+                               font=("Segoe UI", 10, weight),
+                               text_color=c, width=w, anchor="w")
+            lbl.pack(side="left", padx=(4, 0))
+
+    def _auto_refresh(self):
+        try:
+            self.refresh()
+        except Exception as e:
+            worker_log(f"favorites auto_refresh error: {e}")
+        self.after(10000, self._auto_refresh)
+
+
 # ============ ГЛАВНОЕ ОКНО ============
 class SqueezeWidget(ctk.CTk):
     WIDTH = 620
@@ -1772,6 +2034,7 @@ class SqueezeWidget(ctk.CTk):
         self.active_popups = []
         self.bit_window = None
         self.event_window = None
+        self.favorites_window = None
         self.poll()
 
     def _setup_alt_tab(self):
@@ -1848,6 +2111,13 @@ class SqueezeWidget(ctk.CTk):
                                 command=self._export_watchlist)
         btn_wl.pack(side="right", padx=(0, 4))
 
+        btn_fav = ctk.CTkButton(h, text="⭐ Избранное", width=110, height=24,
+                                font=("Segoe UI", 11, "bold"),
+                                fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                text_color=BG_DARK,
+                                command=self._open_favorites_window)
+        btn_fav.pack(side="right", padx=(0, 4))
+
     def _build_legend(self):
         self.legend = LegendBar(self.main)
         self.legend.pack(fill="x", padx=12, pady=(2, 0))
@@ -1918,6 +2188,8 @@ class SqueezeWidget(ctk.CTk):
                               command=self._open_event_window)
         self.menu.add_command(label="Выгрузить Watchlist",
                               command=self._export_watchlist)
+        self.menu.add_command(label="Открыть Избранное",
+                              command=self._open_favorites_window)
         self.menu.add_separator()
         self.menu.add_command(label="Выход", command=self._on_close)
         self.bind("<Button-3>", self._show_menu)
@@ -1943,6 +2215,27 @@ class SqueezeWidget(ctk.CTk):
             except Exception:
                 pass
         self.event_window = EventLogWindow(self)
+
+    def _open_favorites_window(self):
+        if self.favorites_window is not None:
+            try:
+                if self.favorites_window.winfo_exists():
+                    self.favorites_window.lift()
+                    self.favorites_window.focus_force()
+                    return
+            except Exception:
+                pass
+        self.favorites_window = FavoritesWindow(self)
+
+    def _toggle_favorite(self, sym):
+        """v2.1.0: добавить/убрать из Избранного."""
+        try:
+            action = toggle_watchlist(sym)
+            # перерисовка
+            self._last_render_hash = None
+            self.last_draw = 0
+        except Exception as e:
+            worker_log(f"[watchlist] toggle error: {e}")
 
     def _copy_ticker(self, symbol):
         try:
@@ -2011,6 +2304,7 @@ class SqueezeWidget(ctk.CTk):
             save_cache()
             save_last_seen()
             save_bit_history()
+            save_watchlist()
         except Exception:
             pass
         for p in list(self.active_popups):
@@ -2026,6 +2320,11 @@ class SqueezeWidget(ctk.CTk):
         if self.event_window is not None:
             try:
                 self.event_window.destroy()
+            except Exception:
+                pass
+        if self.favorites_window is not None:
+            try:
+                self.favorites_window.destroy()
             except Exception:
                 pass
         worker_log("=== stop ===")
@@ -2182,6 +2481,18 @@ class SqueezeWidget(ctk.CTk):
                                 text_color=icon_color,
                                 width=self.COL_ICON_W)
         icon_lbl.pack(side="left")
+
+        # v2.1.0: иконка Избранного
+        in_fav = is_in_watchlist(sym)
+        fav_char = "★" if in_fav else "☆"
+        fav_color = GOLD if in_fav else GREY
+        fav_lbl = ctk.CTkLabel(row, text=fav_char,
+                                font=("Segoe UI", 14),
+                                text_color=fav_color,
+                                width=22, cursor="hand2")
+        fav_lbl.pack(side="left", padx=(2, 0))
+        fav_lbl.bind("<Button-1>",
+                     lambda e, s=sym: self._toggle_favorite(s))
 
         ticker = sym.replace("USDT", "")
         if sv == "broken_up":
@@ -2413,6 +2724,7 @@ if __name__ == "__main__":
     load_config()
     load_cache()
     load_bit_history()
+    load_watchlist()
     save_last_seen()
     worker_log(f"=== start v{WIDGET_VERSION} ===")
 
