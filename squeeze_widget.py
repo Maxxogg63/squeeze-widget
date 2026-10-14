@@ -1660,7 +1660,7 @@ class BitHistoryWindow(ctk.CTkToplevel):
             self.refresh()
         except Exception as e:
             worker_log(f"bit window auto_refresh error: {e}")
-        self.after(10000, self._auto_refresh)
+        self.after(60000, self._auto_refresh)
 
 
 # ============ ОКНО ЛЕНТЫ СОБЫТИЙ ============
@@ -1966,7 +1966,7 @@ class FavoritesWindow(ctk.CTkToplevel):
             self.refresh()
         except Exception as e:
             worker_log(f"favorites auto_refresh error: {e}")
-        self.after(10000, self._auto_refresh)
+        self.after(60000, self._auto_refresh)
 
 
 # ============ ГЛАВНОЕ ОКНО ============
