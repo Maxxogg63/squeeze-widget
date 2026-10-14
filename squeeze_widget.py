@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.2.7 — фикс дедупликации БИТ
+Версия 2.2.8 — range/started через аргументы
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.2.7"
+WIDGET_VERSION = "2.2.8"
 
 
 # ============ ЦВЕТА ============
@@ -2012,18 +2012,29 @@ def _candles_to_df(candles, limit=None):
 
 
 def open_chart_window(sym, parent_widget, interval="5m"):
-    """v2.2.3: открывает график в отдельном процессе (subprocess)."""
+    """v2.2.8: передаём range/started через аргументы (свежие из памяти)."""
     try:
         worker_path = os.path.join(BASE_DIR, "_chart_worker.py")
         if not os.path.exists(worker_path):
             worker_log(f"[chart] _chart_worker.py not found")
             return
-        # запускаем отдельный процесс
+
+        # берём свежие данные из памяти
+        st = squeeze_state.get(sym, {})
+        range_high = st.get("range_high", 0)
+        range_low = st.get("range_low", 0)
+        started = st.get("started", 0)
+
+        # запускаем отдельный процесс с аргументами
         subprocess.Popen(
-            [sys.executable, worker_path, sym, interval],
+            [sys.executable, worker_path, sym, interval,
+             str(range_high), str(range_low), str(started)],
             cwd=BASE_DIR,
         )
-        worker_log(f"[chart] launched {sym} {interval}")
+        worker_log(
+            f"[chart] launched {sym} {interval} "
+            f"range=[{range_low}..{range_high}] started={started}"
+        )
     except Exception as e:
         worker_log(f"[chart] error: {e}")
 

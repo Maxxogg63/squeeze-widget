@@ -81,21 +81,24 @@ def main():
     interval = sys.argv[2] if len(sys.argv) > 2 else "5m"
     limit = 200 if interval == "5m" else 26
 
-    # читаем state из кэша (границы диапазона)
-    range_high = 0
-    range_low = 0
-    started = 0
-    cache_path = os.path.join(BASE_DIR, "squeeze_cache.json")
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            st = cache.get("squeeze_state", {}).get(sym, {})
-            range_high = st.get("range_high", 0)
-            range_low = st.get("range_low", 0)
-            started = st.get("started", 0)
-        except Exception as e:
-            print(f"cache read error: {e}")
+    # v2.2.8: range/started приходят как аргументы (свежие из памяти виджета)
+    range_high = float(sys.argv[3]) if len(sys.argv) > 3 else 0
+    range_low = float(sys.argv[4]) if len(sys.argv) > 4 else 0
+    started = float(sys.argv[5]) if len(sys.argv) > 5 else 0
+
+    # если не передали — читаем из кэша (fallback)
+    if range_high == 0 and range_low == 0:
+        cache_path = os.path.join(BASE_DIR, "squeeze_cache.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                st = cache.get("squeeze_state", {}).get(sym, {})
+                range_high = st.get("range_high", 0)
+                range_low = st.get("range_low", 0)
+                started = st.get("started", 0)
+            except Exception as e:
+                print(f"cache read error: {e}")
 
     # данные
     try:
