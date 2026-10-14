@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.1.0 — личное Избранное (Watchlist)
+Версия 2.1.1 — фикс МАКС -100% в Избранном
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -22,6 +22,7 @@ Changelog:
     2.0.5 — фикс: io.open → open (io не импортирован)
     2.1.0 — личное Избранное: иконка ☆ в строках, окно "Избранное"
             файл squeeze_watchlist.csv, сортировка по дате
+    2.1.1 — фикс: МАКС -100% при отсутствии данных
 
 Запуск:  python squeeze_widget.py
 Тест:    python squeeze_widget.py --test
@@ -59,7 +60,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.1.0"
+WIDGET_VERSION = "2.1.1"
 
 
 # ============ ЦВЕТА ============
@@ -1916,8 +1917,10 @@ class FavoritesWindow(ctk.CTkToplevel):
                      if c["t"] / 1000.0 >= added_ts]
             if highs:
                 max_price = max(highs)
-        max_pct = ((max_price / price_at_add - 1) * 100
-                   if price_at_add > 0 else 0)
+        # v2.1.1: если нет данных — 0%, а не -100%
+        max_pct = 0.0
+        if price_at_add > 0 and max_price > 0:
+            max_pct = (max_price / price_at_add - 1) * 100
 
         # статус
         st = squeeze_state.get(sym)
