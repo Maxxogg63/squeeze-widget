@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.2.6 — правый клик → меню 5m/1H
+Версия 2.2.7 — фикс дедупликации БИТ
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.2.6"
+WIDGET_VERSION = "2.2.7"
 
 
 # ============ ЦВЕТА ============
@@ -516,7 +516,7 @@ def log_expired(sym, state, reason, final_price):
 # ============ ИСТОРИЯ БИТ ============
 def _bit_history_header():
     return [
-        "symbol", "detected_at", "fired_at",
+        "symbol", "detected_at", "fired_at", "fired_ts",
         "duration_in_range_sec",
         "range_low", "range_high", "width_pct",
         "growth_24h", "volume_24h",
@@ -555,6 +555,11 @@ def load_bit_history():
                             row[k] = int(float(row[k]))
                         except Exception:
                             row[k] = 0
+                if row.get("fired_ts"):
+                    try:
+                        row["fired_ts"] = float(row["fired_ts"])
+                    except Exception:
+                        row["fired_ts"] = 0
                 for k in ("range_low", "range_high", "width_pct",
                           "growth_24h", "volume_24h",
                           "exit_price", "max_after_1h", "max_after_6h",
