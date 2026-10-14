@@ -43,6 +43,15 @@ import websocket
 import customtkinter as ctk
 from tkinter import Menu, filedialog
 
+# v2.2.0: графики
+try:
+    import pandas as pd
+    from lightweight_charts import Chart
+    CHARTS_AVAILABLE = True
+except ImportError as e:
+    CHARTS_AVAILABLE = False
+    print(f"lightweight-charts not available: {e}")
+
 
 # ============ ПУТИ ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1969,6 +1978,128 @@ class FavoritesWindow(ctk.CTkToplevel):
         self.after(60000, self._auto_refresh)
 
 
+# ============ ОКНО ГРАФИКА (v2.2.0) ============
+_chart_windows = {}   # symbol -> Chart
+
+
+def _candles_to_df(candles, limit=None):
+    """Конвертирует список свечей в DataFrame для lightweight-charts."""
+    if not candles:
+        return None
+    lst = list(candles)
+    if limit:
+        lst = lst[-limit:]
+    rows = []
+    for c in lst:
+        rows.append({
+            "time": int(c["t"] / 1000),   # unix seconds
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+            "volume": c.get("volume", 0),
+        })
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["time"]).sort_values("time")
+    return df
+
+
+def open_chart_window(sym, parent_widget):
+    """v2.2.0: открывает окно графика для монеты."""
+    global _chart_windows
+
+    # если уже открыт — просто поднимаем
+    if sym in _chart_windows:
+        try:
+            chart = _chart_windows[sym]
+            chart.win.lift() if hasattr(chart, "win") else None
+            return
+        except Exception:
+            pass
+
+    # данные
+    c5 = buf_5m.get(sym)
+    c1h = buf_1h.get(sym)
+    if not c5:
+        worker_log(f"[chart] no data for {sym}")
+        return
+
+    # state монеты (для линий диапазона)
+    st = squeeze_state.get(sym, {})
+    range_high = st.get("range_high", 0)
+    range_low = st.get("range_low", 0)
+    started = st.get("started", 0)
+
+    try:
+        chart = Chart(
+            width=1000, height=600,
+            title=f"{sym} · 5m",
+        )
+
+        # тёмная тема
+        try:
+            chart.layout(background_color="#116466",
+                         text_color="#D1E8E2")
+            chart.candle_style(
+                up_color="#4ADE80",
+                down_color="#EF4444",
+                border_up_color="#4ADE80",
+                border_down_color="#EF4444",
+                wick_up_color="#4ADE80",
+                wick_down_color="#EF4444",
+            )
+        except Exception:
+            pass
+
+        # данные 5m (200 свечей)
+        df5 = _candles_to_df(c5, limit=200)
+        if df5 is None or df5.empty:
+            worker_log(f"[chart] no 5m data for {sym}")
+            return
+        chart.set(df5)
+
+        # горизонтальные линии диапазона
+        if range_high > 0:
+            try:
+                chart.horizontal_line(range_high, color="#FFCB9A", width=2,
+                                      style="dashed", text="high")
+            except Exception:
+                pass
+        if range_low > 0:
+            try:
+                chart.horizontal_line(range_low, color="#FFCB9A", width=2,
+                                      style="dashed", text="low")
+            except Exception:
+                pass
+
+        # вертикальная линия начала диапазона
+        if started > 0:
+            try:
+                chart.vertical_line(started, color="#FFD166", width=2,
+                                    style="dashed")
+            except Exception:
+                pass
+
+        # topbar: кнопки
+        # если есть textbox — используем для инфо
+        try:
+            if range_high > 0 and range_low > 0:
+                width_pct = (range_high / range_low - 1) * 100
+                chart.topbar.textbox("range",
+                    f"Range: {range_low:.6f} — {range_high:.6f} ({width_pct:.2f}%)")
+        except Exception:
+            pass
+
+        chart.show(block=False)
+        _chart_windows[sym] = chart
+        worker_log(f"[chart] opened {sym}")
+
+    except Exception as e:
+        worker_log(f"[chart] error: {e}")
+        import traceback
+        worker_log(traceback.format_exc())
+
+
 # ============ ГЛАВНОЕ ОКНО ============
 class SqueezeWidget(ctk.CTk):
     WIDTH = 620
@@ -2229,6 +2360,16 @@ class SqueezeWidget(ctk.CTk):
             except Exception:
                 pass
         self.favorites_window = FavoritesWindow(self)
+
+    def _open_chart(self, sym):
+        """v2.2.0: открыть график по двойному клику."""
+        if not CHARTS_AVAILABLE:
+            worker_log("[chart] lightweight-charts не установлен")
+            return
+        try:
+            open_chart_window(sym, self)
+        except Exception as e:
+            worker_log(f"[chart] error opening {sym}: {e}")
 
     def _toggle_favorite(self, sym):
         """v2.1.0: добавить/убрать из Избранного."""
@@ -2514,6 +2655,8 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[0][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
         l.bind("<Button-1>", lambda e, s=sym: self._copy_ticker(s))
+        # v2.2.0: двойной клик → график
+        l.bind("<Double-Button-1>", lambda e, s=sym: self._open_chart(s))
 
         dur = now - st.get("started", now)
         l = ctk.CTkLabel(row, text=fmt_duration(dur),
