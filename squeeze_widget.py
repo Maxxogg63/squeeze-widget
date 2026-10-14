@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.1.1 — фикс МАКС -100% в Избранном
+Версия 2.2.4 — вертикальная линия started на графике
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.1.1"
+WIDGET_VERSION = "2.2.4"
 
 
 # ============ ЦВЕТА ============

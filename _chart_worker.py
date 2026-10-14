@@ -104,6 +104,17 @@ def main():
             except Exception:
                 pass
 
+        # v2.2.4: вертикальная линия начала диапазона
+        if started > 0:
+            try:
+                chart.vertical_line(
+                    pd.to_datetime(started, unit="s"),
+                    color="#FFD166", width=2, style="dashed",
+                    text="start"
+                )
+            except Exception:
+                pass
+
         # topbar
         try:
             if range_high > 0 and range_low > 0:
