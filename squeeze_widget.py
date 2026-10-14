@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.2.4 — вертикальная линия started на графике
+Версия 2.2.6 — правый клик → меню 5m/1H
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.2.4"
+WIDGET_VERSION = "2.2.6"
 
 
 # ============ ЦВЕТА ============
@@ -2284,15 +2284,36 @@ class SqueezeWidget(ctk.CTk):
                 pass
         self.favorites_window = FavoritesWindow(self)
 
-    def _open_chart(self, sym):
+    def _open_chart(self, sym, interval="5m"):
         """v2.2.0: открыть график по двойному клику."""
         if not CHARTS_AVAILABLE:
             worker_log("[chart] lightweight-charts не установлен")
             return
         try:
-            open_chart_window(sym, self)
+            open_chart_window(sym, self, interval=interval)
         except Exception as e:
             worker_log(f"[chart] error opening {sym}: {e}")
+
+    def _show_ticker_menu(self, event, sym):
+        """v2.2.6: правый клик по тикеру → меню 5m/1H."""
+        try:
+            ticker_menu = Menu(self, tearoff=0, bg=BG_DARK, fg=MINT,
+                               activebackground=ACCENT,
+                               activeforeground=BG_DARK, bd=0)
+            ticker_menu.add_command(
+                label=f"Открыть 5m  ({sym.replace('USDT','')})",
+                command=lambda: self._open_chart(sym, "5m"))
+            ticker_menu.add_command(
+                label=f"Открыть 1H  ({sym.replace('USDT','')})",
+                command=lambda: self._open_chart(sym, "1h"))
+            ticker_menu.add_separator()
+            ticker_menu.add_command(
+                label="Копировать тикер",
+                command=lambda: self._copy_ticker(sym))
+            ticker_menu.tk_popup(event.x_root, event.y_root)
+            ticker_menu.grab_release()
+        except Exception as e:
+            worker_log(f"[ticker_menu] error: {e}")
 
     def _toggle_favorite(self, sym):
         """v2.1.0: добавить/убрать из Избранного."""
@@ -2578,8 +2599,12 @@ class SqueezeWidget(ctk.CTk):
                          width=self.COLUMNS[0][1], anchor="w")
         l.pack(side="left", padx=(self.COL_PAD, 0))
         l.bind("<Button-1>", lambda e, s=sym: self._copy_ticker(s))
-        # v2.2.0: двойной клик → график
-        l.bind("<Double-Button-1>", lambda e, s=sym: self._open_chart(s))
+        # v2.2.0: двойной клик → график 5m
+        l.bind("<Double-Button-1>",
+               lambda e, s=sym: self._open_chart(s, "5m"))
+        # v2.2.6: правый клик → меню 5m/1H
+        l.bind("<Button-3>",
+               lambda e, s=sym: self._show_ticker_menu(e, s))
 
         dur = now - st.get("started", now)
         l = ctk.CTkLabel(row, text=fmt_duration(dur),

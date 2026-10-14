@@ -40,6 +40,38 @@ def load_klines(sym, interval, limit):
     return df
 
 
+# глобальные данные для переключения
+_df_5m = None
+_df_1h = None
+
+
+def reload_chart_data(chart, symbol, interval):
+    """Загружает данные для указанного таймфрейма и обновляет график."""
+    global _df_5m, _df_1h
+    try:
+        limit = 200 if interval == "5m" else 26
+        df = load_klines(symbol, interval, limit)
+        if df is None or df.empty:
+            print(f"reload: empty df for {interval}")
+            return
+        if interval == "5m":
+            _df_5m = df
+        else:
+            _df_1h = df
+        # очистить и установить новые данные
+        try:
+            chart.set(df)
+        except Exception:
+            try:
+                chart.clear()
+                chart.set(df)
+            except Exception as e2:
+                print(f"chart.set failed: {e2}")
+                return
+        print(f"reload ok: {symbol} {interval} rows={len(df)}")
+    except Exception as e:
+        print(f"reload error: {e}")
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python _chart_worker.py SYMBOL")
@@ -125,6 +157,8 @@ def main():
                 )
         except Exception:
             pass
+
+        # v2.2.6: switcher убран (не работает) — вместо него меню в виджете
 
         chart.show(block=True)
     except Exception as e:
