@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.2.8 — range/started через аргументы
+Версия 2.3.0 — график БИТ в Истории
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.2.8"
+WIDGET_VERSION = "2.3.0"
 
 
 # ============ ЦВЕТА ============
@@ -1632,6 +1632,12 @@ class BitHistoryWindow(ctk.CTkToplevel):
         else:
             rng_str = "—"
 
+        fired_ts_row = 0
+        try:
+            fired_ts_row = float(row.get("fired_ts", 0))
+        except Exception:
+            fired_ts_row = 0
+
         values = [
             (ticker, GOLD, "bold"),
             (detected[:16] if detected else "—", MINT, "normal"),
@@ -1650,6 +1656,19 @@ class BitHistoryWindow(ctk.CTkToplevel):
                                font=("Segoe UI", 10, weight),
                                text_color=color, width=w, anchor="w")
             lbl.pack(side="left", padx=(4, 0))
+
+        # v2.3.0: двойной клик по тикеру → график БИТ
+        def _on_double_click(event, s=sym, fts=fired_ts_row,
+                             rh=range_high, rl=range_low,
+                             ep=exit_price, da=detected):
+            try:
+                open_history_chart(s, fts, rh, rl, ep, da)
+            except Exception as e:
+                worker_log(f"[history_chart] click error: {e}")
+
+        # навешиваем на тикер (первый label)
+        first_lbl = row_frame.winfo_children()[0]
+        first_lbl.bind("<Double-Button-1>", _on_double_click)
 
     @staticmethod
     def _pct_str(pct):
@@ -2009,6 +2028,27 @@ def _candles_to_df(candles, limit=None):
     df = df.drop_duplicates(subset=["time"]).sort_values("time")
     df = df.set_index("time")
     return df
+
+
+def open_history_chart(sym, fired_ts, range_high, range_low,
+                       exit_price, detected_at):
+    """v2.3.0: открывает график отработанного БИТ (отдельный процесс)."""
+    try:
+        worker_path = os.path.join(BASE_DIR, "_history_chart_worker.py")
+        if not os.path.exists(worker_path):
+            worker_log("[history_chart] _history_chart_worker.py not found")
+            return
+        subprocess.Popen(
+            [sys.executable, worker_path, sym,
+             str(fired_ts), str(range_high), str(range_low),
+             str(exit_price), detected_at],
+            cwd=BASE_DIR,
+        )
+        worker_log(
+            f"[history_chart] launched {sym} fired_ts={fired_ts}"
+        )
+    except Exception as e:
+        worker_log(f"[history_chart] error: {e}")
 
 
 def open_chart_window(sym, parent_widget, interval="5m"):
