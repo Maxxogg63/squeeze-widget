@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures Squeeze Widget
-Версия 2.3.3 — рост/падение, раздел АКТИВНЫЕ
+Версия 2.3.4 — стабильность (кэш, локи, ширина, warmup new)
 
 Changelog:
     1.0–1.3 — эволюция, фиксы
@@ -70,7 +70,7 @@ WATCHLIST_PATH = os.path.join(BASE_DIR, "squeeze_watchlist.csv")
 
 DEBUG_SYMBOLS = ("GTCUSDT", "OGNUSDT", "SUSDT", "BATUSDT")
 
-WIDGET_VERSION = "2.3.3"
+WIDGET_VERSION = "2.3.4"
 
 
 # ============ ЦВЕТА ============
@@ -188,6 +188,11 @@ backstage: dict = {}           # задний двор
 bit_history: list = []         # история БИТ
 bit_history_lock = threading.Lock()
 
+# v2.3.4: локи для shared state (WS-потоки пишут, Tk читает)
+squeeze_state_lock = threading.RLock()
+buf_5m_lock = threading.RLock()
+backstage_lock = threading.RLock()
+
 # v2.0.2: лента событий
 event_log: "collections.deque" = deque(maxlen=200)
 event_log_lock = threading.Lock()
@@ -225,7 +230,7 @@ def _make_filters_txt():
     if os.path.exists(FILTERS_PATH):
         return
     content = """# ============================================================
-# SQUEEZE WIDGET v2.0.0 — НАСТРОЙКИ ФИЛЬТРОВ
+# SQUEEZE WIDGET v2.3.4 — НАСТРОЙКИ ФИЛЬТРОВ
 # Меняй значения, сохраняй, перезапускай виджет.
 # Строки с # — комментарии.
 # ============================================================
@@ -234,7 +239,8 @@ def _make_filters_txt():
 # ФИЛЬТР СВЕЖЕСТИ
 # ------------------------------------------------------------
 
-# Минимальный рост монеты за 24ч (в %).
+# Минимальный рост/падение монеты за 24ч (в %).
+# Применяется к max(growth, drop) — что больше.
 # Дефолт: 20
 growth_24h_min_pct = 20
 
@@ -246,8 +252,8 @@ volume_24h_min_usdt = 10000000
 # ФИЛЬТР ШИРИНЫ ДИАПАЗОНА
 # ------------------------------------------------------------
 
-# Ширина диапазона <= рост * этот коэффициент.
-# 0.8 = диапазон не больше 80% роста.
+# Ширина диапазона <= max(growth, drop) * этот коэффициент.
+# 0.8 = диапазон не больше 80% импульса.
 # Дефолт: 0.8
 range_width_k1 = 0.8
 
@@ -270,18 +276,6 @@ range_forming_min_candles = 6
 # Свечей для "активного" диапазона.
 # Дефолт: 6
 range_active_min_candles = 6
-
-# Зазор для касания границы (%).
-# Дефолт: 0.2
-touch_gap_pct = 0.2
-
-# Свечей подряд close вне диапазона для ухода.
-# Дефолт: 6
-breakout_exit_candles = 6
-
-# Порог "затянувшегося" диапазона (часы).
-# Дефолт: 15
-long_range_hours = 15
 """
     try:
         with open(FILTERS_PATH, "w", encoding="utf-8") as f:
@@ -762,8 +756,14 @@ def is_fresh(growth, volume, drop=0.0):
     return True, "ok"
 
 
-def check_range_width(growth, width):
-    if width > growth * cfg["range_width_k1"]:
+def check_range_width(impulse, width):
+    """
+    v2.3.4: impulse = max(growth_24h, drop_24h).
+    Для монет из секции ПАДЕНИЕ ширина режется относительно падения, а не роста.
+    """
+    if impulse <= 0:
+        return False, "no_impulse"
+    if width > impulse * cfg["range_width_k1"]:
         status["fail_width_k1"] += 1
         return False, "width_k1"
     if width > cfg["range_width_abs_max_pct"]:
@@ -801,13 +801,7 @@ def find_range_start(candles_5m, t_high_ts):
     if min_idx is None:
         return None
 
-    # проверяем, что после min_idx нет low < min_low
-    for j in range(min_idx + 1, len(candles_5m)):
-        if candles_5m[j]["low"] < min_low:
-            # минимум пробит — сдвигаем
-            min_idx = j
-            min_low = candles_5m[j]["low"]
-
+    # v2.3.4: мёртвый цикл убран — ниже глобального min ничего нет
     return min_idx
 
 
@@ -850,12 +844,14 @@ def build_active_state(sym, candles_5m, candles_1h):
         return None
     width = (rh / rl - 1) * 100
 
-    ok, fail_reason = check_range_width(g1h["growth_24h"], width)
+    # v2.3.4: ширина от max(growth, drop)
+    impulse = max(g1h["growth_24h"], g1h.get("drop_24h", 0.0))
+    ok, fail_reason = check_range_width(impulse, width)
     if not ok:
         if sym in DEBUG_SYMBOLS:
             worker_log(
                 f"DEBUG {sym}: REJECT width/{fail_reason} "
-                f"growth={g1h['growth_24h']:.2f}% "
+                f"impulse={impulse:.2f}% "
                 f"width={width:.2f}% candles={len(subset)}"
             )
         return None
@@ -928,9 +924,16 @@ def update_active_state(sym, state, k):
     gap = cfg["touch_gap_pct"] / 100.0
     touch_top = high >= state["range_high"] * (1 - gap)
     touch_bot = low <= state["range_low"] * (1 + gap)
+    touch_side = ""
+    if touch_top:
+        touch_side = "top"
+    if touch_bot:
+        touch_side = touch_side + "/bot" if touch_side else "bot"
     if touch_top or touch_bot:
         state["last_touch"] = now
         state["touch_count"] += 1
+        # v2.3.4: пишем в ленту событий
+        add_event("touch", sym, state, extra=touch_side)
 
     broke_up = close > state["range_high"]
     broke_down = close < state["range_low"]
@@ -1249,6 +1252,14 @@ def warmup_symbol(sym):
 
 
 def warmup_all(symbols):
+    # v2.3.4: перед прогревом — сбросить состояние
+    # (иначе мёртвые диапазоны из кэша остаются после рестарта)
+    with squeeze_state_lock:
+        squeeze_state.clear()
+    with backstage_lock:
+        backstage.clear()
+    worker_log("[v2.3.4] state cleared before warmup")
+
     status["warmup_total"] = len(symbols)
     status["text"] = f"прогрев: 0 / {len(symbols)}"
     done = [0]
@@ -1344,6 +1355,19 @@ def manager():
                 first_run = False
 
             if new:
+                # v2.3.4: прогреваем новые монеты (не только WS)
+                def _warmup_new(new_syms):
+                    done = 0
+                    for s in new_syms:
+                        try:
+                            warmup_symbol(s)
+                        except Exception as e:
+                            worker_log(f"warmup_new error {s}: {e}")
+                        done += 1
+                    worker_log(f"[v2.3.4] warmup_new done: {done}")
+                threading.Thread(target=_warmup_new, args=(new,),
+                                 daemon=True).start()
+
                 for i in range(0, len(new), cfg["chunk_size"]):
                     threading.Thread(
                         target=ws_loop,

@@ -1,0 +1,3 @@
+date;time;ticker;our_start_ts;our_start_time;our_high;our_low;our_width;our_candles;our_impulse;my_start;my_high;my_low;my_width;notes;not_bit
+2026-10-14;18:20:43;SUSDT;1791988500;17:35;0.05612000;0.05451000;2.9536;6;26.3464;;0.05756;0.05438;5.8477;;0
+2026-10-14;18:21:23;DEEPUSDT;1791983400;16:10;0.02390000;0.02307000;3.5977;23;20.1932;;0.02392;0.023070;3.6844;;0
